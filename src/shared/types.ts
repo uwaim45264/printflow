@@ -102,6 +102,10 @@ export interface Order {
   sides: Sides;
   copies: number;
   finishing: FinishingCode;
+  /** Pages to print, e.g. "1-3, 5" (all files together). Empty = all pages. */
+  pageRange: string;
+  /** Pages printed on each side of a sheet: 1, 2 or 4. */
+  pagesPerSheet: number;
   pageCount: number;
   estimatedTotal: number;
   finalAmount: number | null;

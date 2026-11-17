@@ -6,6 +6,7 @@ import { useQuery } from '../../lib/useQuery';
 import { Link, useDocumentTitle } from '../../lib/router';
 import { COLOR_LABEL, FINISHING_LABEL, formatBytes, formatMoney } from '../../lib/format';
 import { estimatePrice } from '../../shared/pricing';
+import { PAGES_PER_SHEET, parsePageRange, type PagesPerSheet } from '../../shared/pageRange';
 import {
   ALLOWED_UPLOAD_EXTENSIONS,
   MAX_UPLOAD_BYTES,
@@ -117,6 +118,8 @@ function UploadScreen({ token, shop }: { token: string; shop: PublicShop }) {
   const [sides, setSides] = useState<Sides>('single');
   const [copies, setCopies] = useState(1);
   const [finishing, setFinishing] = useState<FinishingCode>('none');
+  const [pageRange, setPageRange] = useState('');
+  const [pagesPerSheet, setPagesPerSheet] = useState<PagesPerSheet>(1);
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
   const [notes, setNotes] = useState('');
@@ -132,9 +135,16 @@ function UploadScreen({ token, shop }: { token: string; shop: PublicShop }) {
 
   const effectiveColor: ColorMode = colorsForSize.includes(colorMode) ? colorMode : colorsForSize[0] ?? 'bw';
   const pageCount = files.reduce((s, f) => s + f.pages, 0);
+  const range = useMemo(() => parsePageRange(pageRange, pageCount), [pageRange, pageCount]);
+  const selectedPages = range.pages ? range.pages.length : pageCount;
   const estimate = useMemo(
-    () => estimatePrice({ pageCount, copies, colorMode: effectiveColor, paperSize, sides, finishing }, shop.prices, shop.finishing),
-    [pageCount, copies, effectiveColor, paperSize, sides, finishing, shop],
+    () =>
+      estimatePrice(
+        { pageCount: selectedPages, pagesPerSheet, copies, colorMode: effectiveColor, paperSize, sides, finishing },
+        shop.prices,
+        shop.finishing,
+      ),
+    [selectedPages, pagesPerSheet, copies, effectiveColor, paperSize, sides, finishing, shop],
   );
   const unknownPages = files.some((f) => !f.pagesKnown);
   const uploading = progress !== null;
@@ -215,10 +225,11 @@ function UploadScreen({ token, shop }: { token: string; shop: PublicShop }) {
     if (!files.length) errs.files = 'Add at least one file.';
     if (name.trim().length < 2) errs.name = 'Enter your name.';
     if (!/^[+\d][\d\s()-]{5,}$/.test(phone.trim())) errs.phone = 'Enter a valid phone number.';
+    if (files.length && range.error) errs.pageRange = range.error;
     setErrors(errs);
     setSubmitError(null);
     if (Object.keys(errs).length) {
-      document.getElementById(errs.files ? 'pf-add-files' : errs.name ? 'pf-name' : 'pf-phone')?.focus();
+      document.getElementById(errs.files ? 'pf-add-files' : errs.pageRange ? 'pf-range' : errs.name ? 'pf-name' : 'pf-phone')?.focus();
       return;
     }
 
@@ -226,7 +237,18 @@ function UploadScreen({ token, shop }: { token: string; shop: PublicShop }) {
     try {
       const r = await publicService.createOrder(
         token,
-        { customerName: name.trim(), customerPhone: phone.trim(), notes: notes.trim(), colorMode: effectiveColor, paperSize, sides, copies, finishing },
+        {
+          customerName: name.trim(),
+          customerPhone: phone.trim(),
+          notes: notes.trim(),
+          colorMode: effectiveColor,
+          paperSize,
+          sides,
+          copies,
+          finishing,
+          pageRange: pageRange.trim(),
+          pagesPerSheet,
+        },
         files.map((f) => f.file),
         setProgress,
       );
@@ -496,6 +518,34 @@ function UploadScreen({ token, shop }: { token: string; shop: PublicShop }) {
                   </button>
                 </div>
               </div>
+              <div>
+                <label htmlFor="pf-range" className={label}>Pages to print</label>
+                <input
+                  id="pf-range"
+                  className={cx(control, errors.pageRange && 'border-danger')}
+                  placeholder="All pages"
+                  inputMode="numeric"
+                  value={pageRange}
+                  maxLength={100}
+                  onChange={(e) => {
+                    setPageRange(e.target.value);
+                    setErrors((er) => ({ ...er, pageRange: '' }));
+                  }}
+                  aria-invalid={errors.pageRange || (files.length && range.error) ? true : undefined}
+                  aria-describedby="pf-range-hint"
+                />
+                <p id="pf-range-hint" className={cx('mt-1 text-xs', (errors.pageRange || (files.length && range.error)) ? 'text-danger' : 'text-muted')}>
+                  {errors.pageRange || (files.length && range.error) || 'e.g. 1-3, 5 — counts through all files'}
+                </p>
+              </div>
+              <div>
+                <label htmlFor="pf-per-sheet" className={label}>Pages per sheet</label>
+                <select id="pf-per-sheet" className={control} value={pagesPerSheet} onChange={(e) => setPagesPerSheet(Number(e.target.value) as PagesPerSheet)}>
+                  {PAGES_PER_SHEET.map((n) => (
+                    <option key={n} value={n}>{n === 1 ? '1 (normal)' : `${n} pages on one side`}</option>
+                  ))}
+                </select>
+              </div>
               {shop.finishing.length > 0 && (
                 <div className="col-span-2">
                   <label htmlFor="pf-finishing" className={label}>Finishing</label>
@@ -551,7 +601,7 @@ function UploadScreen({ token, shop }: { token: string; shop: PublicShop }) {
               </div>
               <div className="col-span-2">
                 <label htmlFor="pf-notes" className={label}>Note for the shop (optional)</label>
-                <input id="pf-notes" className={control} placeholder="e.g. pages 1–5 only" value={notes} maxLength={500} onChange={(e) => setNotes(e.target.value)} />
+                <input id="pf-notes" className={control} placeholder="e.g. I will collect at 5 pm" value={notes} maxLength={500} onChange={(e) => setNotes(e.target.value)} />
               </div>
             </div>
           </section>
@@ -574,7 +624,7 @@ function UploadScreen({ token, shop }: { token: string; shop: PublicShop }) {
               ) : (
                 <>
                   <p className="truncate text-xs text-muted">
-                    {files.length ? `${pageCount} page${pageCount === 1 ? '' : 's'} × ${copies} · estimate` : 'Estimated price'}
+                    {files.length ? `${selectedPages} page${selectedPages === 1 ? '' : 's'} × ${copies} · estimate` : 'Estimated price'}
                   </p>
                   <p className="tabular truncate text-xl font-extrabold leading-tight text-ink">
                     {formatMoney(estimate.total)}

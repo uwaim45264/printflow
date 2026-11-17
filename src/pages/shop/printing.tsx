@@ -7,6 +7,7 @@ import { COLOR_LABEL, formatBytes, SIDES_LABEL } from '../../lib/format';
 import { Alert, Button, Modal, Skeleton, cx } from '../../components/ui';
 import { useToast } from '../../components/toast';
 import { isStaleBuildError, reloadForUpdate } from '../../lib/staleBuild';
+import { getDirectPrintSettings, printDirect } from '../../lib/directPrint';
 
 export const isPrintable = (f: OrderFile) => !f.purged && (f.mime === 'application/pdf' || f.mime === 'image/png' || f.mime === 'image/jpeg');
 
@@ -76,11 +77,15 @@ let printFrame: HTMLIFrameElement | null = null;
 let printBlobUrl: string | null = null;
 
 /** Builds the merged PDF in the browser and returns an object URL for it. */
-async function makeBundle(orderId: string, fileIds: string[]): Promise<{ url: string; copiesIncluded: boolean; sheets: number }> {
-  const { blob, copiesIncluded, sheets } = await shopService.buildPrintBundle(orderId, fileIds);
+async function makeBundle(
+  orderId: string,
+  fileIds: string[],
+  includeCopies = true,
+): Promise<{ url: string; blob: Blob; copiesIncluded: boolean; sheets: number }> {
+  const { blob, copiesIncluded, sheets } = await shopService.buildPrintBundle(orderId, fileIds, { includeCopies });
   if (printBlobUrl) URL.revokeObjectURL(printBlobUrl);
   printBlobUrl = URL.createObjectURL(blob);
-  return { url: printBlobUrl, copiesIncluded, sheets };
+  return { url: printBlobUrl, blob, copiesIncluded, sheets };
 }
 
 function openPrintDialog(blobUrl: string): Promise<void> {
@@ -192,7 +197,10 @@ export function PrintDialog({
   const [error, setError] = useState<string | null>(null);
   const [opened, setOpened] = useState<string | null>(null); // PDF URL after the dialog opened
   const [bundle, setBundle] = useState<{ copiesIncluded: boolean; sheets: number } | null>(null);
+  const [direct, setDirect] = useState(getDirectPrintSettings);
+  const [sentTo, setSentTo] = useState<string | null>(null); // printer name after a direct print
   const submitted = useRef(false);
+  const useDirect = direct.enabled && !!direct.printer;
 
   const files = order.files.filter((f) => fileIds.includes(f.id));
   const pages = files.reduce((s, f) => s + f.pages, 0);
@@ -203,19 +211,36 @@ export function PrintDialog({
     setError(null);
     setOpened(null);
     setBundle(null);
+    setSentTo(null);
+    setDirect(getDirectPrintSettings());
     setBusy(false);
     setMarkPrinting(ORDER_TRANSITIONS[order.status].includes('printing'));
   }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const doPrint = async () => {
+  const doPrint = async (mode: 'direct' | 'dialog') => {
     if (busy || submitted.current) return; // prevent double submissions
     setError(null);
     setBusy(true);
     try {
-      const { url, copiesIncluded, sheets } = await makeBundle(order.id, fileIds);
-      setBundle({ copiesIncluded, sheets });
-      await openPrintDialog(url);
-      setOpened(url);
+      if (mode === 'direct' && direct.printer) {
+        // The print program sets copies, paper size, colour and sides itself, so copies are not repeated in the file.
+        const { blob } = await makeBundle(order.id, fileIds, false);
+        await printDirect({
+          printer: direct.printer,
+          pdf: blob,
+          copies: order.copies,
+          paperSize: order.paperSize,
+          colorMode: order.colorMode,
+          sides: order.sides,
+          jobName: `PrintFlow order #${order.orderNo}`,
+        });
+        setSentTo(direct.printer);
+      } else {
+        const { url, copiesIncluded, sheets } = await makeBundle(order.id, fileIds);
+        setBundle({ copiesIncluded, sheets });
+        await openPrintDialog(url);
+        setOpened(url);
+      }
       submitted.current = true;
       onOrderUpdated(await shopService.logPrint(order.id, fileIds, markPrinting));
     } catch (err) {
@@ -240,7 +265,9 @@ export function PrintDialog({
       title={`Print order #${order.orderNo}`}
       description={`${files.length} file${files.length === 1 ? '' : 's'} · ${pages} page${pages === 1 ? '' : 's'} · originals are not changed`}
       footer={
-        opened ? (
+        sentTo ? (
+          <Button onClick={onClose}>Done</Button>
+        ) : opened ? (
           <>
             <a href={opened} target="_blank" rel="noreferrer" className="mr-auto inline-flex h-11 items-center gap-2 rounded-xl px-3 text-sm font-semibold text-ink-soft hover:bg-cream-deep">
               <ExternalLink className="size-4" aria-hidden /> Open PDF instead
@@ -249,17 +276,35 @@ export function PrintDialog({
           </>
         ) : (
           <>
-            <Button variant="secondary" onClick={onClose} disabled={busy}>
+            <Button variant="secondary" onClick={onClose} disabled={busy} className={useDirect ? 'mr-auto' : undefined}>
               Cancel
             </Button>
-            <Button icon={<Printer className="size-4" />} loading={busy} disabled={!files.length} onClick={doPrint}>
-              Open print dialog
-            </Button>
+            {useDirect ? (
+              <>
+                <Button variant="secondary" disabled={busy || !files.length} onClick={() => doPrint('dialog')}>
+                  Browser dialog
+                </Button>
+                <Button icon={<Printer className="size-4" />} loading={busy} disabled={!files.length} onClick={() => doPrint('direct')}>
+                  Print now
+                </Button>
+              </>
+            ) : (
+              <Button icon={<Printer className="size-4" />} loading={busy} disabled={!files.length} onClick={() => doPrint('dialog')}>
+                Open print dialog
+              </Button>
+            )}
           </>
         )
       }
     >
-      {opened ? (
+      {sentTo ? (
+        <div className="space-y-4">
+          <Alert tone="success" title={`Sent to ${sentTo}`}>
+            Printing {order.copies} cop{order.copies === 1 ? 'y' : 'ies'} on {order.paperSize}, {COLOR_LABEL[order.colorMode].toLowerCase()},{' '}
+            {SIDES_LABEL[order.sides].toLowerCase()}. If QZ Tray asked to allow PrintFlow, choose Allow.
+          </Alert>
+        </div>
+      ) : opened ? (
         <div className="space-y-4">
           <Alert tone="success" title="Print dialog opened">
             Choose the printer and settings in the dialog and press Print. If nothing appeared, use “Open PDF instead” and print from there.
@@ -269,7 +314,19 @@ export function PrintDialog({
       ) : (
         <div className="space-y-5">
           {error && <Alert tone="danger">{error}</Alert>}
-          <Reminder order={order} bundle={bundle} />
+          {useDirect ? (
+            <div className="rounded-xl border border-gold/70 bg-gold-soft px-4 py-3 text-sm">
+              <p className="font-semibold text-ink">Print now on {direct.printer}</p>
+              <p className="mt-0.5 text-ink-soft">
+                {order.copies} cop{order.copies === 1 ? 'y' : 'ies'} · {order.paperSize} · {COLOR_LABEL[order.colorMode]} · {SIDES_LABEL[order.sides]}
+                {order.pagesPerSheet > 1 ? ` · ${order.pagesPerSheet} pages per sheet` : ''}
+                {order.pageRange ? ` · pages ${order.pageRange.replace(/,/g, ', ')}` : ''}
+              </p>
+              <p className="mt-1 text-xs text-ink-soft">Set automatically — no print dialog. Change the printer in Settings.</p>
+            </div>
+          ) : (
+            <Reminder order={order} bundle={bundle} />
+          )}
 
           <ul className="max-h-40 divide-y divide-line overflow-y-auto rounded-xl border border-line" aria-label="Files to print">
             {files.map((f) => (
@@ -307,7 +364,12 @@ function Reminder({ order, bundle }: { order: OrderDetail; bundle: { copiesInclu
       <p className="font-semibold text-ink">Customer asked for</p>
       <p className="mt-0.5 text-ink-soft">
         {order.copies} cop{order.copies === 1 ? 'y' : 'ies'} · {order.paperSize} · {COLOR_LABEL[order.colorMode]} · {SIDES_LABEL[order.sides]}
+        {order.pagesPerSheet > 1 ? ` · ${order.pagesPerSheet} pages per sheet` : ''}
+        {order.pageRange ? ` · pages ${order.pageRange.replace(/,/g, ', ')}` : ''}
       </p>
+      {(order.pagesPerSheet > 1 || order.pageRange) && (
+        <p className="mt-1 text-xs text-ink-soft">Pages to print and pages per sheet are already done in the file.</p>
+      )}
       <p className="mt-2 text-xs font-semibold text-ink">In the print dialog</p>
       <ul className="mt-0.5 list-disc space-y-0.5 pl-4 text-xs text-ink-soft">
         {steps.map((s) => (

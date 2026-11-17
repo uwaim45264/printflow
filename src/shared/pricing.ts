@@ -1,7 +1,11 @@
+import { printedSides } from './pageRange';
 import type { ColorMode, FinishingCode, FinishingOption, PaperSize, PriceRule, Sides } from './types';
 
 export interface EstimateInput {
+  /** Pages selected to print (all files together; after the page range). */
   pageCount: number;
+  /** Pages printed on each side of a sheet (1, 2 or 4). Default 1. */
+  pagesPerSheet?: number;
   copies: number;
   colorMode: ColorMode;
   paperSize: PaperSize;
@@ -20,7 +24,8 @@ export interface Estimate {
 
 /**
  * Price estimate used by the customer page (preview) and publicService (saved with the order).
- * Double-sided rate is charged per sheet (2 pages per sheet).
+ * Pages are put pagesPerSheet to a side; double-sided rate is charged per sheet (2 sides per sheet).
+ * Same formula as printflow_create_order() in the database.
  */
 export function estimatePrice(input: EstimateInput, rules: PriceRule[], finishing: FinishingOption[]): Estimate {
   const rule = rules.find((r) => r.paperSize === input.paperSize && r.colorMode === input.colorMode);
@@ -29,7 +34,8 @@ export function estimatePrice(input: EstimateInput, rules: PriceRule[], finishin
   if (!rule) {
     return { sheets: 0, ratePerSheet: 0, printCost: 0, finishingCost: 0, total: 0, available: false };
   }
-  const sheets = input.sides === 'double' ? Math.ceil(pages / 2) : pages;
+  const sides = printedSides(pages, input.pagesPerSheet ?? 1);
+  const sheets = input.sides === 'double' ? Math.ceil(sides / 2) : sides;
   const ratePerSheet = input.sides === 'double' ? rule.priceDouble : rule.priceSingle;
   const printCost = sheets * ratePerSheet * copies;
   let finishingCost = 0;

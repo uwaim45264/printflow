@@ -247,6 +247,8 @@ export function ShopOrderDetail({ id }: { id: string }) {
               <Spec label="Copies" value={String(o.copies)} />
               <Spec label="Finishing" value={FINISHING_LABEL[o.finishing]} />
               <Spec label="Pages" value={String(o.pageCount)} />
+              <Spec label="Pages to print" value={o.pageRange ? o.pageRange.replace(/,/g, ', ') : 'All'} />
+              <Spec label="Pages per sheet" value={String(o.pagesPerSheet)} />
             </dl>
             {o.notes && (
               <div className="border-t border-line px-5 py-4 sm:px-6">

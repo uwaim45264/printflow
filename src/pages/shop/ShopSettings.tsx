@@ -7,6 +7,7 @@ import { useToast } from '../../components/toast';
 import { ChangePasswordForm } from '../auth/ChangePasswordForm';
 import { ShopFields, validateShopForm, type ShopFormValues } from '../admin/ShopForm';
 import { useShop } from './ShopContext';
+import { DirectPrintCard } from './DirectPrintCard';
 
 export function ShopSettings() {
   useDocumentTitle('Settings');
@@ -41,7 +42,7 @@ export function ShopSettings() {
 
   return (
     <>
-      <PageHeader title="Settings" description="Your shop details and sign-in password." />
+      <PageHeader title="Settings" description="Your shop details, printing and sign-in password." />
       <div className="grid gap-6 lg:grid-cols-[1.4fr_1fr]">
         <Card>
           <CardHeader title="Shop details" description="Customers see these on your upload page." />
@@ -59,6 +60,7 @@ export function ShopSettings() {
           )}
         </Card>
         <div className="space-y-6">
+          <DirectPrintCard />
           <Card className="h-fit">
             <CardHeader title="Change password" description="Other devices are signed out after a change." />
             <div className="p-5 sm:p-6">

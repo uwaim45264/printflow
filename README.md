@@ -10,8 +10,8 @@ Requires **Node.js 20.19+** and a Supabase project (free tier is fine).
 
 1. **Install:** `npm install`
 2. **Configure:** copy `.env.example` to `.env`. Fill in `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` from **Dashboard → Project Settings → API**.
-3. **Create the database:** in **Dashboard → SQL Editor**, paste the contents of `supabase/migrations/20261113000000_printflow_init.sql` and run it.
-4. **Deploy the file function:** run `npx supabase login`, then `npx supabase functions deploy printflow-files --no-verify-jwt --project-ref <your-ref>`. Or in the Dashboard: **Edge Functions → Deploy a new function**, name it `printflow-files`, paste `supabase/functions/printflow-files/index.ts`, and turn **Verify JWT** off. Shop owners need this function to open and print uploaded files.
+3. **Create the database:** in **Dashboard → SQL Editor**, run each file in `supabase/migrations/` in name order (paste → Run): `…_printflow_init.sql`, `…_admin_account.sql`, `…_direct_file_access.sql`, `…_page_options.sql`.
+4. **(Optional) file function:** files are opened straight from Storage. The `printflow-files` Edge Function is only a fallback; deploy it with `npx supabase functions deploy printflow-files --no-verify-jwt --project-ref <your-ref>` if you want it.
 5. **Create the Super Admin.** Pick one:
    - In the SQL Editor: `select printflow_svc_create_super_admin('superadmin', 'YourPassword123');`
    - With Node: set `SUPABASE_SERVICE_ROLE_KEY`, `SUPER_ADMIN_USERNAME` and `SUPER_ADMIN_PASSWORD` in `.env`, then run `npm run seed`.
@@ -53,7 +53,7 @@ Shops created by the Super Admin get a temporary password that must be changed a
    - **Customer, or no or invalid token:** nothing.
 4. Clients can't read `printflow_users` or `printflow_sessions` at all. Every write goes through a `printflow_*` database function, which checks the session, validates input and writes the activity log.
 5. Changing a password, an admin reset, or deactivating a shop ends the affected sessions immediately.
-6. **Files:** customers can upload new files to `incoming/…` in the private bucket `printflow-files`, but can never read them. Shop owners open files through short-lived links from the `printflow-files` Edge Function, which asks the database (with the owner's token) which files they may open. Deleted files and abandoned uploads are removed by the same function.
+6. **Files:** customers can upload new files to `incoming/…` in the private bucket `printflow-files`, but can never read them. Storage RLS reads the same session header: shop owners can read only their own shop's files, and files queued for deletion are removed by the app (`cleanupStorage`).
 7. `printflow_create_order` recalculates the price from the shop's own prices, so the browser's estimate is only a preview.
 
 Without Supabase Realtime, dashboards refresh every 15 seconds and right after any change made in the same browser.
@@ -62,7 +62,12 @@ Without Supabase Realtime, dashboards refresh every 15 seconds and right after a
 
 - **Generate:** Shop owner → **QR code** creates the QR image in the browser (`qrcode`), with print and PNG download.
 - **Scan:** Home page → **Scan a shop QR code** decodes with the camera or from a photo/screenshot (`jsqr`), then opens the shop's upload page.
-- Printing uses the browser's print dialog (selected files are merged into one PDF in the browser).
+## Printing
+
+Selected files are merged into one PDF in the browser with the customer's instructions applied: pages to print, pages per sheet (1/2/4), paper size, grey photos for black & white, and the copies.
+
+- **Direct printing (recommended):** install the free [QZ Tray](https://qz.io/download/) on the shop computer, then **Settings → Direct printing** → turn on and choose the printer. **Print now** sends the job with the exact copies, paper size, colour and sides, without a print dialog. Saved per computer.
+- **Browser print dialog:** works everywhere. Browsers do not let a website preset the dialog, so paper size and colour are chosen by hand (the print window lists what to choose); copies are already in the file.
 
 ## Project structure
 

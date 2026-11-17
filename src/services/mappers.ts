@@ -46,6 +46,8 @@ export interface OrderRow {
   sides: Sides;
   copies: number;
   finishing: FinishingCode;
+  page_range?: string; // added by migration 20261117020000
+  pages_per_sheet?: number;
   page_count: number;
   estimated_total: number | string;
   final_amount: number | string | null;
@@ -67,6 +69,7 @@ export interface OrderFileRow {
   pages: number;
   created_at: string;
   stored: boolean;
+  position?: number; // added by migration 20261117020000
 }
 
 export interface OrderEventRow {
@@ -124,6 +127,8 @@ export function toOrder(r: OrderRow & { order_files?: { count: number }[] | Orde
     sides: r.sides,
     copies: r.copies,
     finishing: r.finishing,
+    pageRange: r.page_range ?? '',
+    pagesPerSheet: r.pages_per_sheet ?? 1,
     pageCount: r.page_count,
     estimatedTotal: num(r.estimated_total),
     finalAmount: r.final_amount === null ? null : num(r.final_amount),
@@ -149,7 +154,9 @@ export const toOrderFile = (f: OrderFileRow): OrderFile => ({
 export const toOrderEvent = (e: OrderEventRow): OrderEvent => ({ status: e.status, note: e.note, actor: e.actor, createdAt: e.created_at });
 
 export function toOrderDetail(r: OrderRow & { order_files: OrderFileRow[]; order_events: OrderEventRow[] }): OrderDetail {
-  const files = [...r.order_files].sort((a, b) => a.created_at.localeCompare(b.created_at) || a.original_name.localeCompare(b.original_name)).map(toOrderFile);
+  const files = [...r.order_files]
+    .sort((a, b) => (a.position ?? 0) - (b.position ?? 0) || a.created_at.localeCompare(b.created_at) || a.original_name.localeCompare(b.original_name))
+    .map(toOrderFile);
   const events = [...r.order_events].sort((a, b) => a.id - b.id).map(toOrderEvent);
   return { ...toOrder(r, files.length), files, events };
 }
