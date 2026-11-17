@@ -26,7 +26,19 @@ interface LoginResult {
   code?: string;
 }
 
-export async function login(portal: 'admin' | 'shop', usernameInput: string, password: string): Promise<SessionUser> {
+/**
+ * Signs in. portal 'any' (the single sign-in page) accepts Super Admins and shop owners: it tries the shop
+ * portal first and, if the database says the account is a Super Admin (password already verified), the admin portal.
+ */
+export async function login(portal: 'admin' | 'shop' | 'any', usernameInput: string, password: string): Promise<SessionUser> {
+  if (portal === 'any') {
+    try {
+      return await login('shop', usernameInput, password);
+    } catch (err) {
+      if (err instanceof ServiceError && err.code === 'USE_ADMIN_LOGIN') return login('admin', usernameInput, password);
+      throw err;
+    }
+  }
   ensureConfigured();
   oneOf(portal, 'portal', ['admin', 'shop'] as const, 'Portal');
   const username = text(usernameInput, 'username', { label: 'Username', required: true, max: 60 }).toLowerCase();

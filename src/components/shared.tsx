@@ -50,7 +50,7 @@ export function CredentialsModal({
 }) {
   const toast = useToast();
   const [copied, setCopied] = useState(false);
-  const text = `PrintFlow shop sign-in\nAddress: ${window.location.origin}/shop/login\nUsername: ${username}\nTemporary password: ${password}\n(You will be asked to choose a new password.)`;
+  const text = `PrintFlow shop sign-in\nAddress: ${window.location.origin}/login\nUsername: ${username}\nTemporary password: ${password}\n(You will be asked to choose a new password.)`;
   return (
     <Modal
       open={open}
@@ -86,7 +86,7 @@ export function CredentialsModal({
           <dl className="mt-3 space-y-2 text-sm">
             <div className="flex flex-wrap justify-between gap-2">
               <dt className="text-ink-soft">Sign-in page</dt>
-              <dd className="font-mono font-semibold text-ink [overflow-wrap:anywhere]">{window.location.origin}/shop/login</dd>
+              <dd className="font-mono font-semibold text-ink [overflow-wrap:anywhere]">{window.location.origin}/login</dd>
             </div>
             <div className="flex flex-wrap justify-between gap-2">
               <dt className="text-ink-soft">Username</dt>

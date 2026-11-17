@@ -28,9 +28,8 @@ export function ForcePasswordChange() {
         className="mt-4"
         icon={<LogOut className="size-4" />}
         onClick={async () => {
-          const to = user?.role === 'super_admin' ? '/admin/login' : '/shop/login';
           await logout();
-          navigate(to, { replace: true });
+          navigate('/login', { replace: true });
         }}
       >
         Sign out

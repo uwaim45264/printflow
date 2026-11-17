@@ -5,7 +5,7 @@ import { authService, onDbChange } from '../services';
 interface AuthState {
   user: SessionUser | null;
   loading: boolean;
-  login: (portal: 'admin' | 'shop', username: string, password: string) => Promise<SessionUser>;
+  login: (portal: 'admin' | 'shop' | 'any', username: string, password: string) => Promise<SessionUser>;
   logout: () => Promise<void>;
   setUser: (u: SessionUser | null) => void;
 }
@@ -27,7 +27,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return onDbChange(check);
   }, []);
 
-  const login = useCallback(async (portal: 'admin' | 'shop', username: string, password: string) => {
+  const login = useCallback(async (portal: 'admin' | 'shop' | 'any', username: string, password: string) => {
     const u = await authService.login(portal, username, password);
     setUser(u);
     return u;

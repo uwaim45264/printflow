@@ -88,10 +88,10 @@ export function LandingPage() {
               <p className="text-[15px] text-ink-soft">Sign in to see incoming files, update prices and print your QR code.</p>
             </div>
             <Link
-              to="/shop/login"
+              to="/login"
               className="inline-flex h-11 items-center gap-2 rounded-xl bg-ink px-5 text-sm font-semibold text-white hover:bg-ink-soft"
             >
-              Shop sign in <ArrowRight className="size-4" aria-hidden />
+              Sign in <ArrowRight className="size-4" aria-hidden />
             </Link>
           </div>
         </div>

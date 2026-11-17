@@ -30,11 +30,10 @@ export function DashboardLayout({
   useEffect(() => setOpen(false), [path]);
 
   const isActive = (item: NavItem) => (item.exact ? path === item.to : path === item.to || path.startsWith(item.to + '/'));
-  const loginPath = user?.role === 'super_admin' ? '/admin/login' : '/shop/login';
 
   const handleLogout = async () => {
     await logout();
-    navigate(loginPath, { replace: true });
+    navigate('/login', { replace: true });
   };
 
   const sidebar = (

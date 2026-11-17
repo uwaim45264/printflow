@@ -32,9 +32,8 @@ import { ShopSettings } from './pages/shop/ShopSettings';
 function RequireRole({ role, children }: { role: Role; children: React.ReactNode }) {
   const { user, loading } = useAuth();
   const { path } = useLocation();
-  const loginPath = role === 'super_admin' ? '/admin/login' : '/shop/login';
   if (loading) return <Spinner label="Checking your session…" />;
-  if (!user || user.role !== role) return <Redirect to={`${loginPath}?next=${encodeURIComponent(path)}`} />;
+  if (!user || user.role !== role) return <Redirect to={`/login?next=${encodeURIComponent(path)}`} />;
   if (user.mustChangePassword) return <ForcePasswordChange />;
   return <>{children}</>;
 }
@@ -95,8 +94,9 @@ function Routes() {
   if ((m = matchPath('/s/:token', path))) return <CustomerUploadPage token={m.token} />;
   if (path === '/track') return <TrackOrderPage />;
   if ((m = matchPath('/track/:code', path))) return <TrackOrderPage code={m.code} />;
-  if (path === '/admin/login') return <LoginPage portal="admin" />;
-  if (path === '/shop/login') return <LoginPage portal="shop" />;
+  if (path === '/login') return <LoginPage />;
+  // Old sign-in addresses (bookmarks, links already sent to shop owners) open the single sign-in page.
+  if (path === '/admin/login' || path === '/shop/login') return <Redirect to={`/login${window.location.search}`} />;
 
   if (path === '/admin' || path.startsWith('/admin/')) {
     return (

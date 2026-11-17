@@ -25,8 +25,8 @@ Other scripts: `npm run build` (typecheck + production build into `dist/`), `npm
 
 | Role | Sign in at | What they can do |
 | --- | --- | --- |
-| **Super Admin** | `/admin/login` | Create, edit, activate/deactivate and delete shops; generate and reset shop-owner credentials; platform stats and activity log |
-| **Shop owner** | `/shop/login` | Only their own shop: orders and files, order status, payment, prices, QR code, shop details, own password |
+| **Super Admin** | `/login` | Create, edit, activate/deactivate and delete shops; generate and reset shop-owner credentials; platform stats and activity log |
+| **Shop owner** | `/login` | Only their own shop: orders and files, order status, payment, prices, QR code, shop details, own password |
 | **Customer** | — | Scan the shop QR (`/s/<token>`), upload files and track an order with its tracking code. No login. |
 
 Shops created by the Super Admin get a temporary password that must be changed at first sign-in.
