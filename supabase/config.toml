@@ -1,0 +1,6 @@
+# Minimal Supabase CLI config (used by `npx supabase link`, `db push` and `functions deploy`).
+project_id = "printflow-qr"
+
+# PrintFlow uses its own sessions (not Supabase Auth JWTs); the function checks the session token itself.
+[functions.printflow-files]
+verify_jwt = false

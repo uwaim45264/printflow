@@ -1,14 +1,15 @@
 import type { ActivityEntry, AdminStats, Shop, ShopWithStats } from '../shared/types';
-import { generateTempPassword, hashPassword, newQrToken, passwordProblem, randomId } from './crypto';
+import { passwordProblem } from './crypto';
 import { invalid, notFound } from './errors';
-import { last7Days, startOfTodayIso, toShop, toShopWithStats } from './mappers';
-import { ensureSeeded, seedShopDefaults } from './seed';
-import { requireRole, revokeUserSessions } from './session';
-import { deleteFiles } from './storage/fileStore';
-import { logActivity, nowIso, readDb, writeDb, type DbSchema } from './storage/localDb';
+import { last7Days, startOfTodayIso, toShop, weekStartIso, type ShopRow } from './mappers';
+import { requireRole } from './session';
+import { check, cleanupStorage, isUuid, rpc, supabase } from './supabase';
 import { email, oneOf, phone, text, username } from './validate';
 
-/** Super Admin operations. Every function checks the signed-in user is a Super Admin. */
+/**
+ * Super Admin operations. Reads use Row Level Security (only a Super Admin sees every shop);
+ * changes (including creating logins and resetting passwords) go through database functions.
+ */
 
 export interface ShopInput {
   name: string;
@@ -25,10 +26,7 @@ export interface Credentials {
   temporaryPassword: string;
 }
 
-async function admin() {
-  await ensureSeeded();
-  return requireRole('super_admin');
-}
+const admin = () => requireRole('super_admin');
 
 function readShopFields(v: Partial<ShopInput>): ShopInput {
   return {
@@ -42,158 +40,154 @@ function readShopFields(v: Partial<ShopInput>): ShopInput {
   };
 }
 
-function findShop(db: DbSchema, id: string) {
-  const shop = db.shops.find((s) => s.id === id);
-  if (!shop) throw notFound('Shop not found.');
-  return shop;
+interface StatsRow {
+  shop_id: string;
+  order_count: number;
+  pending_count: number;
+  last_order_at: string | null;
+}
+
+interface OwnerInfo {
+  shopId: string;
+  username: string;
+  lastLoginAt: string | null;
+}
+
+async function shopsWithStats(shopId?: string): Promise<ShopWithStats[]> {
+  let shopsQ = supabase.from('printflow_shops').select('*').order('created_at', { ascending: false });
+  let statsQ = supabase.from('printflow_shop_order_stats').select('*');
+  if (shopId) {
+    shopsQ = shopsQ.eq('id', shopId);
+    statsQ = statsQ.eq('shop_id', shopId);
+  }
+  const [shops, owners, stats] = await Promise.all([shopsQ, rpc<OwnerInfo[]>('printflow_admin_shop_owners'), statsQ]);
+  const ownerBy = new Map(owners.map((o) => [o.shopId, o]));
+  const statsBy = new Map((check(stats) as StatsRow[]).map((s) => [s.shop_id, s]));
+  return (check(shops) as ShopRow[]).map((s) => {
+    const owner = ownerBy.get(s.id);
+    const st = statsBy.get(s.id);
+    return {
+      ...toShop(s),
+      ownerUsername: owner?.username ?? null,
+      ownerLastLoginAt: owner?.lastLoginAt ?? null,
+      orderCount: st?.order_count ?? 0,
+      pendingCount: st?.pending_count ?? 0,
+      lastOrderAt: st?.last_order_at ?? null,
+    };
+  });
 }
 
 export async function getStats(): Promise<AdminStats> {
   await admin();
-  const db = readDb();
-  const today = startOfTodayIso();
-  return {
-    shopsTotal: db.shops.length,
-    shopsActive: db.shops.filter((s) => s.status === 'active').length,
-    ordersTotal: db.orders.length,
-    ordersToday: db.orders.filter((o) => o.createdAt >= today).length,
-    ordersPending: db.orders.filter((o) => o.status === 'pending').length,
-    storageBytes: db.orderFiles.filter((f) => f.stored).reduce((sum, f) => sum + f.size, 0),
-    last7Days: last7Days(db.orders),
-    topShops: db.shops
-      .map((s) => ({ id: s.id, name: s.name, orders: db.orders.filter((o) => o.shopId === s.id).length }))
-      .sort((a, b) => b.orders - a.orders || a.name.localeCompare(b.name))
-      .slice(0, 5),
-  };
+  const s = await rpc<Omit<AdminStats, 'last7Days'> & { recent: string[] }>('printflow_admin_stats', { p_today: startOfTodayIso(), p_week_start: weekStartIso() });
+  const { recent, ...rest } = s;
+  return { ...rest, storageBytes: Number(rest.storageBytes), last7Days: last7Days(recent) };
 }
 
 export async function listShops(): Promise<ShopWithStats[]> {
   await admin();
-  const db = readDb();
-  return db.shops.map((s) => toShopWithStats(db, s)).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  return shopsWithStats();
 }
 
 export async function getShop(id: string): Promise<ShopWithStats> {
   await admin();
-  const db = readDb();
-  return toShopWithStats(db, findShop(db, id));
+  if (!isUuid(id)) throw notFound('Shop not found.');
+  const [shop] = await shopsWithStats(id);
+  if (!shop) throw notFound('Shop not found.');
+  return shop;
 }
 
 export async function createShop(input: ShopInput & { ownerUsername: string; ownerPassword?: string }): Promise<{ shop: Shop; credentials: Credentials }> {
-  const me = await admin();
-  const fields = readShopFields(input);
+  await admin();
+  const f = readShopFields(input);
   const ownerUsername = username(input.ownerUsername, 'ownerUsername');
-  let tempPassword = input.ownerPassword || '';
-  if (tempPassword) {
-    const problem = passwordProblem(tempPassword);
+  if (input.ownerPassword) {
+    const problem = passwordProblem(input.ownerPassword);
     if (problem) throw invalid(problem, 'ownerPassword');
-  } else {
-    tempPassword = generateTempPassword();
   }
-  const passwordHash = await hashPassword(tempPassword);
-
-  const shop = writeDb((db) => {
-    if (db.users.some((u) => u.username === ownerUsername)) throw invalid('That username is already taken.', 'ownerUsername');
-    const now = nowIso();
-    const shopId = randomId('shp', 6);
-    let qrToken = newQrToken();
-    while (db.shops.some((s) => s.qrToken === qrToken)) qrToken = newQrToken();
-    const row = { id: shopId, ...fields, status: 'active' as const, qrToken, nextOrderNo: 1001, createdAt: now, updatedAt: now };
-    db.shops.push(row);
-    db.users.push({
-      id: randomId('usr'),
-      username: ownerUsername,
-      name: fields.ownerName,
-      passwordHash,
-      role: 'shop_owner',
-      shopId,
-      mustChangePassword: true,
-      createdAt: now,
-      lastLoginAt: null,
-      passwordChangedAt: null,
-    });
-    seedShopDefaults(db, shopId);
-    logActivity(db, me.username, 'Created shop', `${fields.name} (owner login: ${ownerUsername})`, shopId);
-    return toShop(row);
+  const res = await rpc<{ shopId: string; username: string; temporaryPassword: string }>('printflow_admin_create_shop', {
+    p_name: f.name,
+    p_owner_name: f.ownerName,
+    p_phone: f.phone,
+    p_email: f.email,
+    p_address: f.address,
+    p_city: f.city,
+    p_operating_hours: f.operatingHours,
+    p_owner_username: ownerUsername,
+    p_owner_password: input.ownerPassword || null,
   });
-  // The temporary password is returned once; only its hash is stored.
-  return { shop, credentials: { username: ownerUsername, temporaryPassword: tempPassword } };
+  const row = check(await supabase.from('printflow_shops').select('*').eq('id', res.shopId).single()) as ShopRow;
+  // The temporary password is shown once; the database stores only its bcrypt hash.
+  return { shop: toShop(row), credentials: { username: res.username, temporaryPassword: res.temporaryPassword } };
 }
 
 export async function updateShop(id: string, input: ShopInput): Promise<ShopWithStats> {
-  const me = await admin();
+  await admin();
+  if (!isUuid(id)) throw notFound('Shop not found.');
   const f = readShopFields(input);
-  return writeDb((db) => {
-    const shop = findShop(db, id);
-    Object.assign(shop, f, { updatedAt: nowIso() });
-    db.users.filter((u) => u.shopId === id && u.role === 'shop_owner').forEach((u) => (u.name = f.ownerName));
-    logActivity(db, me.username, 'Updated shop details', f.name, id);
-    return toShopWithStats(db, shop);
+  await rpc('printflow_admin_update_shop', {
+    p_shop_id: id,
+    p_name: f.name,
+    p_owner_name: f.ownerName,
+    p_phone: f.phone,
+    p_email: f.email,
+    p_address: f.address,
+    p_city: f.city,
+    p_operating_hours: f.operatingHours,
   });
+  return getShop(id);
 }
 
 export async function setShopStatus(id: string, status: 'active' | 'inactive'): Promise<ShopWithStats> {
-  const me = await admin();
+  await admin();
+  if (!isUuid(id)) throw notFound('Shop not found.');
   const next = oneOf(status, 'status', ['active', 'inactive'] as const, 'Status');
-  return writeDb((db) => {
-    const shop = findShop(db, id);
-    shop.status = next;
-    shop.updatedAt = nowIso();
-    if (next === 'inactive') db.users.filter((u) => u.shopId === id).forEach((u) => revokeUserSessions(db, u.id));
-    logActivity(db, me.username, next === 'active' ? 'Activated shop' : 'Deactivated shop', shop.name, id);
-    return toShopWithStats(db, shop);
-  });
+  await rpc('printflow_admin_set_shop_status', { p_shop_id: id, p_status: next });
+  return getShop(id);
 }
 
 export async function resetOwnerPassword(id: string): Promise<Credentials> {
-  const me = await admin();
-  const tempPassword = generateTempPassword();
-  const hash = await hashPassword(tempPassword);
-  return writeDb((db) => {
-    const shop = findShop(db, id);
-    const owner = db.users.find((u) => u.shopId === id && u.role === 'shop_owner');
-    if (!owner) throw notFound('This shop has no owner account.');
-    owner.passwordHash = hash;
-    owner.mustChangePassword = true;
-    owner.passwordChangedAt = nowIso();
-    revokeUserSessions(db, owner.id);
-    logActivity(db, me.username, 'Reset shop owner password', `${shop.name} (${owner.username})`, id);
-    return { username: owner.username, temporaryPassword: tempPassword };
-  });
+  await admin();
+  if (!isUuid(id)) throw notFound('Shop not found.');
+  return rpc<Credentials>('printflow_admin_reset_owner_password', { p_shop_id: id });
 }
 
 export async function deleteShop(id: string, confirmName: string): Promise<void> {
-  const me = await admin();
-  const fileIds = writeDb((db) => {
-    const shop = findShop(db, id);
-    if (confirmName !== shop.name) throw invalid('Type the shop name exactly to confirm deletion.', 'confirmName');
-    const orderIds = new Set(db.orders.filter((o) => o.shopId === id).map((o) => o.id));
-    const userIds = new Set(db.users.filter((u) => u.shopId === id).map((u) => u.id));
-    const files = db.orderFiles.filter((f) => f.shopId === id).map((f) => f.id);
-    db.shops = db.shops.filter((s) => s.id !== id);
-    db.users = db.users.filter((u) => !userIds.has(u.id));
-    db.sessions = db.sessions.filter((s) => !userIds.has(s.userId));
-    db.priceRules = db.priceRules.filter((r) => r.shopId !== id);
-    db.finishing = db.finishing.filter((f) => f.shopId !== id);
-    db.orders = db.orders.filter((o) => o.shopId !== id);
-    db.orderFiles = db.orderFiles.filter((f) => f.shopId !== id);
-    db.orderEvents = db.orderEvents.filter((e) => !orderIds.has(e.orderId));
-    db.activity.forEach((a) => {
-      if (a.shopId === id) a.shopId = null;
-    });
-    logActivity(db, me.username, 'Deleted shop', shop.name, null);
-    return files;
-  });
-  await deleteFiles(fileIds);
+  await admin();
+  if (!isUuid(id)) throw notFound('Shop not found.');
+  await rpc('printflow_admin_delete_shop', { p_shop_id: id, p_confirm_name: confirmName });
+  cleanupStorage(); // removes the shop's files from Storage in the background
+}
+
+interface ActivityRow {
+  id: number;
+  shop_id: string | null;
+  actor: string;
+  action: string;
+  details: string;
+  created_at: string;
+  shop: { name: string } | null;
 }
 
 export async function listActivity(shopId?: string): Promise<ActivityEntry[]> {
   await admin();
-  const db = readDb();
-  const names = new Map(db.shops.map((s) => [s.id, s.name]));
-  return db.activity
-    .filter((a) => !shopId || a.shopId === shopId)
-    .sort((a, b) => b.id - a.id)
-    .slice(0, shopId ? 100 : 200)
-    .map((a) => ({ ...a, shopName: a.shopId ? names.get(a.shopId) ?? null : null }));
+  let q = supabase
+    .from('printflow_activity_log')
+    .select('id, shop_id, actor, action, details, created_at, shop:printflow_shops(name)')
+    .order('id', { ascending: false })
+    .limit(shopId ? 100 : 200);
+  if (shopId) {
+    if (!isUuid(shopId)) return [];
+    q = q.eq('shop_id', shopId);
+  }
+  const rows = check(await q) as unknown as ActivityRow[];
+  return rows.map((a) => ({
+    id: a.id,
+    shopId: a.shop_id,
+    shopName: a.shop?.name ?? null,
+    actor: a.actor,
+    action: a.action,
+    details: a.details,
+    createdAt: a.created_at,
+  }));
 }

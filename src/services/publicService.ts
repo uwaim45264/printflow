@@ -1,38 +1,18 @@
 import { estimatePrice } from '../shared/pricing';
 import { COLOR_MODES, MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES, PAPER_SIZES, type ColorMode, type FinishingCode, type PaperSize, type PublicShop, type PublicTracking, type Sides } from '../shared/types';
-import { randomCode, randomId } from './crypto';
 import { invalid, notFound, ServiceError } from './errors';
 import { inspectUpload, type CheckedFile } from './fileInspect';
-import { getFinishing, getPriceRules } from './mappers';
-import { ensureSeeded } from './seed';
-import { deleteFiles, putFile } from './storage/fileStore';
-import { addOrderEvent, logActivity, nowIso, readDb, writeDb, type DbSchema } from './storage/localDb';
+import { BUCKET, ensureConfigured, rpc, supabase } from './supabase';
 import { int, oneOf, phone, text } from './validate';
 
 /** Customer-facing operations (no sign-in needed). */
 
 const INVALID_QR = 'This QR code is not valid. Please ask the shop for their current QR code.';
 
-function shopByToken(db: DbSchema, token: string) {
-  if (!/^[a-z0-9]{6,40}$/.test(token)) return null;
-  return db.shops.find((s) => s.qrToken === token) ?? null;
-}
-
 export async function getShopByToken(token: string): Promise<PublicShop> {
-  await ensureSeeded();
-  const db = readDb();
-  const shop = shopByToken(db, token);
-  if (!shop) throw notFound(INVALID_QR);
-  return {
-    name: shop.name,
-    address: shop.address,
-    city: shop.city,
-    phone: shop.phone,
-    operatingHours: shop.operatingHours,
-    isOpen: shop.status === 'active',
-    prices: getPriceRules(db, shop.id),
-    finishing: getFinishing(db, shop.id).filter((f) => f.enabled),
-  };
+  ensureConfigured();
+  if (!/^[a-z0-9]{6,40}$/.test(token)) throw notFound(INVALID_QR);
+  return rpc<PublicShop>('printflow_get_public_shop', { p_token: token });
 }
 
 export interface NewOrderInput {
@@ -54,15 +34,14 @@ export interface NewOrderResult {
 }
 
 /**
- * Creates an order with its files. File contents go to IndexedDB first, then the order record is saved.
- * `onProgress` receives 0..1 while files are stored.
+ * Creates an order with its files.
+ * 1. Each file is uploaded to the private Storage bucket (customers can upload but never read files).
+ * 2. `create_order` checks the uploads exist, calculates the price from the shop's prices and saves the order.
+ * `onProgress` receives 0..1 while files are uploaded.
  */
 export async function createOrder(token: string, input: NewOrderInput, files: File[], onProgress?: (fraction: number) => void): Promise<NewOrderResult> {
-  await ensureSeeded();
-  const before = readDb();
-  const shop = shopByToken(before, token);
-  if (!shop) throw notFound(INVALID_QR);
-  if (shop.status !== 'active') throw new ServiceError(403, 'This shop is not accepting online orders right now.');
+  const shop = await getShopByToken(token);
+  if (!shop.isOpen) throw new ServiceError(403, 'This shop is not accepting online orders right now.');
 
   if (files.length === 0) throw invalid('Please add at least one document.');
   if (files.length > MAX_UPLOAD_FILES) throw invalid(`You can upload up to ${MAX_UPLOAD_FILES} files at once.`);
@@ -75,98 +54,46 @@ export async function createOrder(token: string, input: NewOrderInput, files: Fi
   const paperSize = oneOf(input.paperSize, 'paperSize', PAPER_SIZES, 'Paper size');
   const sides = oneOf(input.sides, 'sides', ['single', 'double'] as const, 'Sides');
   const copies = int(input.copies, 'copies', { label: 'Copies', min: 1, max: 500 });
-  const finishingOptions = getFinishing(before, shop.id).filter((f) => f.enabled);
-  const finishing = oneOf(input.finishing, 'finishing', ['none', ...finishingOptions.map((f) => f.code)] as FinishingCode[], 'Finishing', 'none');
+  const finishing = oneOf(input.finishing, 'finishing', ['none', ...shop.finishing.map((f) => f.code)] as FinishingCode[], 'Finishing', 'none');
 
   const checked: CheckedFile[] = [];
   for (const f of files) checked.push(await inspectUpload(f));
   const pageCount = checked.reduce((sum, f) => sum + f.pages, 0);
-  const estimate = estimatePrice({ pageCount, copies, colorMode, paperSize, sides, finishing }, getPriceRules(before, shop.id), finishingOptions);
+  const estimate = estimatePrice({ pageCount, copies, colorMode, paperSize, sides, finishing }, shop.prices, shop.finishing);
   if (!estimate.available) throw invalid('This shop does not offer that paper size and color combination.');
 
-  // 1. Store the file contents.
-  const fileIds = checked.map(() => randomId('fil'));
+  // 1. Upload the files.
+  const batch = crypto.randomUUID();
   const totalBytes = checked.reduce((s, f) => s + f.size, 0) || 1;
   let doneBytes = 0;
   onProgress?.(0);
-  try {
-    for (let i = 0; i < checked.length; i++) {
-      await putFile(fileIds[i], checked[i].file);
-      doneBytes += checked[i].size;
-      onProgress?.(doneBytes / totalBytes);
+  const uploaded: { path: string; name: string; mime: string; pages: number }[] = [];
+  for (const f of checked) {
+    const path = `incoming/${batch}/${crypto.randomUUID()}`;
+    const { error } = await supabase.storage.from(BUCKET).upload(path, f.file, { contentType: f.mime, upsert: false });
+    if (error) {
+      throw new ServiceError(
+        /size|too large|exceed/i.test(error.message) ? 413 : 503,
+        /size|too large|exceed/i.test(error.message) ? `"${f.originalName}" is too large.` : `Could not upload "${f.originalName}". Check your connection and try again.`,
+      );
     }
-  } catch (err) {
-    await deleteFiles(fileIds).catch(() => {});
-    throw err;
+    uploaded.push({ path, name: f.originalName, mime: f.mime, pages: f.pages });
+    doneBytes += f.size;
+    onProgress?.(doneBytes / totalBytes);
   }
 
-  // 2. Save the order record (rolls back the stored files if this fails).
-  try {
-    return writeDb((db) => {
-      const row = db.shops.find((s) => s.id === shop.id);
-      if (!row || row.status !== 'active') throw new ServiceError(403, 'This shop is not accepting online orders right now.');
-      const orderNo = row.nextOrderNo;
-      row.nextOrderNo += 1;
-      let trackingCode = randomCode(8);
-      while (db.orders.some((o) => o.trackingCode === trackingCode)) trackingCode = randomCode(8);
-      const orderId = randomId('ord');
-      const now = nowIso();
-      db.orders.push({
-        id: orderId,
-        shopId: shop.id,
-        orderNo,
-        trackingCode,
-        customerName,
-        customerPhone,
-        notes,
-        colorMode,
-        paperSize,
-        sides,
-        copies,
-        finishing,
-        pageCount,
-        estimatedTotal: estimate.total,
-        finalAmount: null,
-        status: 'pending',
-        paymentStatus: 'unpaid',
-        rejectionReason: null,
-        createdAt: now,
-        updatedAt: now,
-      });
-      checked.forEach((f, i) =>
-        db.orderFiles.push({ id: fileIds[i], orderId, shopId: shop.id, originalName: f.originalName, mime: f.mime, size: f.size, pages: f.pages, createdAt: now, stored: true }),
-      );
-      addOrderEvent(db, orderId, 'pending', 'Order received via QR code', 'customer', now);
-      logActivity(db, 'customer', 'New order received', `#${orderNo} · ${checked.length} file(s)`, shop.id);
-      return { trackingCode, orderNo, estimatedTotal: estimate.total, pageCount };
-    });
-  } catch (err) {
-    await deleteFiles(fileIds).catch(() => {});
-    throw err;
-  }
+  // 2. Save the order (the database recalculates the price; the client's estimate is only a preview).
+  return rpc<NewOrderResult>('printflow_create_order', {
+    p_token: token,
+    p_order: { customerName, customerPhone, notes, colorMode, paperSize, sides, copies, finishing },
+    p_files: uploaded,
+  });
 }
 
 export async function trackOrder(codeInput: string): Promise<PublicTracking> {
-  await ensureSeeded();
+  ensureConfigured();
   const code = String(codeInput).toUpperCase().replace(/[^A-Z0-9]/g, '');
-  const db = readDb();
-  const o = db.orders.find((x) => x.trackingCode === code);
-  if (!o) throw notFound('No order found with that tracking code.');
-  return {
-    trackingCode: o.trackingCode,
-    orderNo: o.orderNo,
-    shopName: db.shops.find((s) => s.id === o.shopId)?.name ?? '',
-    status: o.status,
-    estimatedTotal: o.estimatedTotal,
-    finalAmount: o.finalAmount,
-    paymentStatus: o.paymentStatus,
-    rejectionReason: o.rejectionReason,
-    fileCount: db.orderFiles.filter((f) => f.orderId === o.id).length,
-    createdAt: o.createdAt,
-    updatedAt: o.updatedAt,
-    events: db.orderEvents
-      .filter((e) => e.orderId === o.id)
-      .sort((a, b) => a.id - b.id)
-      .map((e) => ({ status: e.status, createdAt: e.createdAt })),
-  };
+  if (!code) throw notFound('No order found with that tracking code.');
+  const t = await rpc<PublicTracking>('printflow_track_order', { p_code: code });
+  return { ...t, estimatedTotal: Number(t.estimatedTotal), finalAmount: t.finalAmount === null ? null : Number(t.finalAmount) };
 }

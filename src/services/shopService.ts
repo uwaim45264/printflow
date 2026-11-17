@@ -2,7 +2,6 @@ import {
   COLOR_MODES,
   FINISHING_CODES,
   ORDER_STATUSES,
-  ORDER_TRANSITIONS,
   PAPER_SIZES,
   type FinishingOption,
   type Order,
@@ -13,43 +12,45 @@ import {
   type Shop,
   type ShopStats,
 } from '../shared/types';
-import { newQrToken } from './crypto';
 import { invalid, notFound, ServiceError } from './errors';
-import { getFinishing, getPriceRules, last7Days, startOfMonthIso, startOfTodayIso, toOrder, toOrderDetail, toShop } from './mappers';
-import { ensureSeeded } from './seed';
+import {
+  last7Days,
+  startOfMonthIso,
+  startOfTodayIso,
+  toFinishing,
+  toOrder,
+  toOrderDetail,
+  toPriceRules,
+  toShop,
+  weekStartIso,
+  type FinishingRow,
+  type OrderEventRow,
+  type OrderFileRow,
+  type OrderRow,
+  type PriceRuleRow,
+  type ShopRow,
+} from './mappers';
 import { requireRole } from './session';
-import { deleteFiles, getFile } from './storage/fileStore';
-import { addOrderEvent, logActivity, nowIso, readDb, writeDb, type DbSchema } from './storage/localDb';
+import { check, cleanupStorage, filesFunction, getToken, isUuid, rpc, supabase } from './supabase';
 import { email, money, oneOf, phone, text } from './validate';
 
 /**
- * Shop-owner operations. The shop id ALWAYS comes from the signed-in session, never from the caller,
- * so one shop can never read or change another shop's data.
+ * Shop-owner operations. The shop id ALWAYS comes from the signed-in session, and Row Level Security
+ * in the database only returns the owner's own shop's rows, so one shop can never see another shop's data.
  */
 
 async function owner() {
-  await ensureSeeded();
-  const user = requireRole('shop_owner');
+  const user = await requireRole('shop_owner');
   return { shopId: user.shopId!, actor: user.username };
-}
-
-function findOrder(db: DbSchema, shopId: string, orderId: string) {
-  const o = db.orders.find((x) => x.id === orderId && x.shopId === shopId);
-  if (!o) throw notFound('Order not found.');
-  return o;
-}
-
-function findShop(db: DbSchema, shopId: string) {
-  const s = db.shops.find((x) => x.id === shopId);
-  if (!s) throw notFound('Shop not found.');
-  return s;
 }
 
 // ---------- Profile ----------
 
 export async function getMyShop(): Promise<Shop> {
   const { shopId } = await owner();
-  return toShop(findShop(readDb(), shopId));
+  const row = check(await supabase.from('printflow_shops').select('*').eq('id', shopId).maybeSingle()) as ShopRow | null;
+  if (!row) throw notFound('Shop not found.');
+  return toShop(row);
 }
 
 export interface ShopProfileInput {
@@ -62,44 +63,34 @@ export interface ShopProfileInput {
 }
 
 export async function updateMyShop(v: ShopProfileInput): Promise<Shop> {
-  const { shopId, actor } = await owner();
-  const fields = {
-    name: text(v.name, 'name', { label: 'Shop name', required: true, max: 80, min: 2 }),
-    phone: phone(v.phone, 'phone', 'Phone', true),
-    email: email(v.email, 'email', false),
-    address: text(v.address, 'address', { label: 'Address', max: 200 }),
-    city: text(v.city, 'city', { label: 'City', max: 60 }),
-    operatingHours: text(v.operatingHours, 'operatingHours', { label: 'Opening hours', max: 80 }),
-  };
-  return writeDb((db) => {
-    const shop = findShop(db, shopId);
-    Object.assign(shop, fields, { updatedAt: nowIso() });
-    logActivity(db, actor, 'Updated shop profile', '', shopId);
-    return toShop(shop);
+  await owner();
+  await rpc('printflow_shop_update_profile', {
+    p_name: text(v.name, 'name', { label: 'Shop name', required: true, max: 80, min: 2 }),
+    p_phone: phone(v.phone, 'phone', 'Phone', true),
+    p_email: email(v.email, 'email', false),
+    p_address: text(v.address, 'address', { label: 'Address', max: 200 }),
+    p_city: text(v.city, 'city', { label: 'City', max: 60 }),
+    p_operating_hours: text(v.operatingHours, 'operatingHours', { label: 'Opening hours', max: 80 }),
   });
+  return getMyShop();
 }
 
 export async function getStats(): Promise<ShopStats> {
-  const { shopId } = await owner();
-  const orders = readDb().orders.filter((o) => o.shopId === shopId);
-  const today = startOfTodayIso();
-  const month = startOfMonthIso();
-  return {
-    ordersToday: orders.filter((o) => o.createdAt >= today).length,
-    pending: orders.filter((o) => o.status === 'pending').length,
-    inProgress: orders.filter((o) => o.status === 'accepted' || o.status === 'printing').length,
-    readyForPickup: orders.filter((o) => o.status === 'ready').length,
-    completedThisMonth: orders.filter((o) => o.status === 'completed' && o.updatedAt >= month).length,
-    revenueThisMonth: orders
-      .filter((o) => o.paymentStatus === 'paid' && o.updatedAt >= month)
-      .reduce((sum, o) => sum + (o.finalAmount ?? o.estimatedTotal), 0),
-    last7Days: last7Days(orders),
-  };
+  await owner();
+  const s = await rpc<Omit<ShopStats, 'last7Days'> & { recent: string[] }>('printflow_shop_stats', {
+    p_today: startOfTodayIso(),
+    p_month: startOfMonthIso(),
+    p_week_start: weekStartIso(),
+  });
+  const { recent, ...rest } = s;
+  return { ...rest, revenueThisMonth: Number(rest.revenueThisMonth), last7Days: last7Days(recent) };
 }
 
 // ---------- Orders ----------
 
 export type OrderFilter = OrderStatus | 'active' | 'all';
+
+const ORDER_DETAIL_SELECT = '*, order_files:printflow_order_files(*), order_events:printflow_order_events(id, status, note, actor, created_at)';
 
 export async function listOrders(opts: { status?: OrderFilter; q?: string; limit?: number; offset?: number } = {}): Promise<{ orders: Order[]; total: number }> {
   const { shopId } = await owner();
@@ -108,95 +99,104 @@ export async function listOrders(opts: { status?: OrderFilter; q?: string; limit
   const q = (opts.q ?? '').trim().slice(0, 60).toLowerCase();
   const limit = Math.min(500, Math.max(1, opts.limit ?? 25));
   const offset = Math.max(0, opts.offset ?? 0);
-  const db = readDb();
-  const active: OrderStatus[] = ['pending', 'accepted', 'printing', 'ready'];
-  const rows = db.orders
-    .filter((o) => o.shopId === shopId)
-    .filter((o) => !status || (status === 'active' ? active.includes(o.status) : o.status === status))
-    .filter(
-      (o) =>
-        !q ||
-        o.customerName.toLowerCase().includes(q) ||
-        o.customerPhone.toLowerCase().includes(q) ||
-        o.trackingCode.toLowerCase().includes(q) ||
-        String(o.orderNo).includes(q),
-    )
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  return { total: rows.length, orders: rows.slice(offset, offset + limit).map((o) => toOrder(db, o)) };
+
+  let query = supabase.from('printflow_orders').select('*, order_files:printflow_order_files(count)', { count: 'exact' }).eq('shop_id', shopId);
+  if (status === 'active') query = query.in('status', ['pending', 'accepted', 'printing', 'ready']);
+  else if (status) query = query.eq('status', status);
+  if (q) query = query.ilike('search_text', `%${q.replace(/[\\%_*]/g, (c) => `\\${c}`)}%`);
+  const res = await query.order('created_at', { ascending: false }).range(offset, offset + limit - 1);
+  const rows = check(res) as (OrderRow & { order_files: { count: number }[] })[];
+  return { total: res.count ?? rows.length, orders: rows.map((o) => toOrder(o)) };
 }
 
 export async function getOrder(orderId: string): Promise<OrderDetail> {
   const { shopId } = await owner();
-  const db = readDb();
-  return toOrderDetail(db, findOrder(db, shopId, orderId));
+  if (!isUuid(orderId)) throw notFound('Order not found.');
+  const row = check(await supabase.from('printflow_orders').select(ORDER_DETAIL_SELECT).eq('id', orderId).eq('shop_id', shopId).maybeSingle()) as
+    | (OrderRow & { order_files: OrderFileRow[]; order_events: OrderEventRow[] })
+    | null;
+  if (!row) throw notFound('Order not found.');
+  return toOrderDetail(row);
 }
 
 export async function setOrderStatus(orderId: string, next: OrderStatus, extra: { reason?: string; note?: string } = {}): Promise<OrderDetail> {
-  const { shopId, actor } = await owner();
+  await owner();
+  if (!isUuid(orderId)) throw notFound('Order not found.');
   const status = oneOf(next, 'status', ORDER_STATUSES, 'Status');
-  return writeDb((db) => {
-    const o = findOrder(db, shopId, orderId);
-    if (!ORDER_TRANSITIONS[o.status].includes(status)) throw invalid(`An order that is "${o.status}" cannot be moved to "${status}".`);
-    const reason = status === 'rejected' ? text(extra.reason, 'reason', { label: 'Reason', required: true, max: 300 }) : null;
-    const note = text(extra.note, 'note', { label: 'Note', max: 300 }) || reason;
-    const now = nowIso();
-    o.status = status;
-    if (reason) o.rejectionReason = reason;
-    o.updatedAt = now;
-    addOrderEvent(db, o.id, status, note || null, actor, now);
-    logActivity(db, actor, 'Order status changed', `#${o.orderNo} → ${status}`, shopId);
-    return toOrderDetail(db, o);
-  });
+  const reason = status === 'rejected' ? text(extra.reason, 'reason', { label: 'Reason', required: true, max: 300 }) : null;
+  const note = text(extra.note, 'note', { label: 'Note', max: 300 }) || null;
+  await rpc('printflow_shop_set_order_status', { p_order_id: orderId, p_status: status, p_reason: reason, p_note: note });
+  return getOrder(orderId);
 }
 
 export async function setBilling(orderId: string, finalAmount: number | null, paymentStatus: 'paid' | 'unpaid'): Promise<OrderDetail> {
-  const { shopId } = await owner();
+  await owner();
+  if (!isUuid(orderId)) throw notFound('Order not found.');
   const amount = finalAmount === null ? null : money(finalAmount, 'Final amount', 'finalAmount');
   const pay = oneOf(paymentStatus, 'paymentStatus', ['unpaid', 'paid'] as const, 'Payment status');
-  return writeDb((db) => {
-    const o = findOrder(db, shopId, orderId);
-    o.finalAmount = amount;
-    o.paymentStatus = pay;
-    o.updatedAt = nowIso();
-    return toOrderDetail(db, o);
-  });
+  await rpc('printflow_shop_set_billing', { p_order_id: orderId, p_final_amount: amount, p_payment_status: pay });
+  return getOrder(orderId);
 }
 
 /** Deletes the stored documents of an order (the order record and history are kept). */
 export async function purgeOrderFiles(orderId: string): Promise<OrderDetail> {
-  const { shopId, actor } = await owner();
-  const { detail, ids } = writeDb((db) => {
-    const o = findOrder(db, shopId, orderId);
-    const files = db.orderFiles.filter((f) => f.orderId === o.id && f.shopId === shopId && f.stored);
-    files.forEach((f) => (f.stored = false));
-    logActivity(db, actor, 'Deleted order files', `#${o.orderNo}`, shopId);
-    return { detail: toOrderDetail(db, o), ids: files.map((f) => f.id) };
+  await owner();
+  if (!isUuid(orderId)) throw notFound('Order not found.');
+  await rpc<number>('printflow_shop_purge_order_files', { p_order_id: orderId });
+  cleanupStorage(); // removes the files from Storage in the background
+  return getOrder(orderId);
+}
+
+async function fileRow(shopId: string, fileId: string): Promise<OrderFileRow> {
+  if (!isUuid(fileId)) throw notFound('File not found.');
+  const row = check(await supabase.from('printflow_order_files').select('*').eq('id', fileId).eq('shop_id', shopId).maybeSingle()) as OrderFileRow | null;
+  if (!row) throw notFound('File not found.');
+  if (!row.stored) throw new ServiceError(410, 'This file has been deleted.');
+  return row;
+}
+
+/** Downloads files through short-lived links from the printflow-files Edge Function (which checks the session). */
+async function downloadAll(rows: OrderFileRow[]): Promise<Map<string, Blob>> {
+  const token = getToken();
+  if (!token) throw new ServiceError(401, 'Please sign in.');
+  const { files } = await filesFunction<{ files: { id: string; url: string | null; deleted: boolean }[] }>({
+    action: 'sign',
+    token,
+    fileIds: rows.map((r) => r.id),
   });
-  await deleteFiles(ids);
-  return detail;
+  const out = new Map<string, Blob>();
+  for (const row of rows) {
+    const link = files.find((f) => f.id === row.id);
+    if (!link || link.deleted || !link.url) throw new ServiceError(410, `"${row.original_name}" has been deleted.`);
+    const res = await fetch(link.url).catch(() => null);
+    if (!res || !res.ok) throw new ServiceError(res?.status === 404 ? 404 : 503, `Could not download "${row.original_name}". Please try again.`);
+    const blob = await res.blob();
+    out.set(row.id, blob.type === row.mime ? blob : new Blob([blob], { type: row.mime }));
+  }
+  return out;
 }
 
 /** The contents of one uploaded file, as a Blob with the right type. */
 export async function getFileBlob(fileId: string): Promise<{ blob: Blob; name: string; mime: string }> {
   const { shopId } = await owner();
-  const row = readDb().orderFiles.find((f) => f.id === fileId && f.shopId === shopId);
-  if (!row) throw notFound('File not found.');
-  if (!row.stored) throw new ServiceError(410, 'This file has been deleted.');
-  const blob = await getFile(row.id);
-  if (!blob) throw notFound('File is missing from this browser’s storage.');
-  return { blob: blob.type === row.mime ? blob : new Blob([blob], { type: row.mime }), name: row.originalName, mime: row.mime };
+  const row = await fileRow(shopId, fileId);
+  const blob = (await downloadAll([row])).get(row.id)!;
+  return { blob, name: row.original_name, mime: row.mime };
 }
 
 // ---------- Pricing ----------
 
 export async function getPricing(): Promise<{ prices: PriceRule[]; finishing: FinishingOption[] }> {
   const { shopId } = await owner();
-  const db = readDb();
-  return { prices: getPriceRules(db, shopId), finishing: getFinishing(db, shopId) };
+  const [prices, finishing] = await Promise.all([
+    supabase.from('printflow_price_rules').select('paper_size, color_mode, price_single, price_double').eq('shop_id', shopId),
+    supabase.from('printflow_finishing_options').select('code, name, price, enabled').eq('shop_id', shopId),
+  ]);
+  return { prices: toPriceRules(check(prices) as PriceRuleRow[]), finishing: toFinishing(check(finishing) as FinishingRow[]) };
 }
 
 export async function savePricing(input: { prices: PriceRule[]; finishing: { code: string; price: number; enabled: boolean }[] }) {
-  const { shopId, actor } = await owner();
+  await owner();
   const { prices, finishing } = input;
   if (!Array.isArray(prices) || !Array.isArray(finishing)) throw invalid('Prices and finishing options are required.');
   if (prices.length > PAPER_SIZES.length * COLOR_MODES.length || finishing.length > FINISHING_CODES.length) throw invalid('Too many price rows.');
@@ -205,47 +205,38 @@ export async function savePricing(input: { prices: PriceRule[]; finishing: { cod
     const mode = oneOf(p.colorMode, 'colorMode', COLOR_MODES, 'Color mode');
     return { paperSize: size, colorMode: mode, priceSingle: money(p.priceSingle, `${size} single-sided price`), priceDouble: money(p.priceDouble, `${size} double-sided price`) };
   });
+  const seen = new Set(cleanPrices.map((p) => `${p.paperSize}/${p.colorMode}`));
+  if (seen.size !== cleanPrices.length) throw invalid('Each paper size and color can only have one price.');
   const cleanFinishing = finishing.map((f) => ({ code: oneOf(f.code, 'code', FINISHING_CODES, 'Finishing option'), price: money(f.price, 'Finishing price'), enabled: !!f.enabled }));
-  return writeDb((db) => {
-    db.priceRules = db.priceRules.filter((r) => r.shopId !== shopId).concat(cleanPrices.map((p) => ({ shopId, ...p })));
-    for (const f of cleanFinishing) {
-      const row = db.finishing.find((x) => x.shopId === shopId && x.code === f.code);
-      if (row) Object.assign(row, { price: f.price, enabled: f.enabled });
-    }
-    logActivity(db, actor, 'Updated printing prices', '', shopId);
-    return { prices: getPriceRules(db, shopId), finishing: getFinishing(db, shopId) };
-  });
+  await rpc('printflow_shop_save_pricing', { p_prices: cleanPrices, p_finishing: cleanFinishing });
+  return getPricing();
 }
 
 // ---------- QR code ----------
 
 export async function regenerateQr(): Promise<Shop> {
-  const { shopId, actor } = await owner();
-  return writeDb((db) => {
-    const shop = findShop(db, shopId);
-    let token = newQrToken();
-    while (db.shops.some((s) => s.qrToken === token)) token = newQrToken();
-    shop.qrToken = token;
-    shop.updatedAt = nowIso();
-    logActivity(db, actor, 'Generated a new QR code', 'Previous QR code no longer works', shopId);
-    return toShop(shop);
-  });
+  await owner();
+  await rpc('printflow_shop_regenerate_qr');
+  return getMyShop();
 }
 
 // ---------- Printing (browser print dialog) ----------
 
 const PRINTABLE_MIMES = ['application/pdf', 'image/png', 'image/jpeg'];
 
-function printableFiles(db: DbSchema, shopId: string, orderId: string, fileIds: string[]) {
+function printableFiles(order: OrderDetail, rows: OrderFileRow[], fileIds: string[]) {
   if (!fileIds.length) throw invalid('Select at least one file to print.');
-  const rows = db.orderFiles.filter((f) => f.orderId === orderId && f.shopId === shopId);
   return [...new Set(fileIds)].map((id) => {
-    const f = rows.find((r) => r.id === id);
+    const f = rows.find((r) => r.id === id && r.order_id === order.id);
     if (!f) throw notFound('One of the selected files was not found in this order.');
-    if (!f.stored) throw new ServiceError(410, `"${f.originalName}" has been deleted and can’t be printed.`);
-    if (!PRINTABLE_MIMES.includes(f.mime)) throw new ServiceError(422, `"${f.originalName}" is a Word document. Download it and print it from Word.`);
+    if (!f.stored) throw new ServiceError(410, `"${f.original_name}" has been deleted and can’t be printed.`);
+    if (!PRINTABLE_MIMES.includes(f.mime)) throw new ServiceError(422, `"${f.original_name}" is a Word document. Download it and print it from Word.`);
     return f;
   });
+}
+
+async function orderFileRows(shopId: string, orderId: string): Promise<OrderFileRow[]> {
+  return check(await supabase.from('printflow_order_files').select('*').eq('order_id', orderId).eq('shop_id', shopId)) as OrderFileRow[];
 }
 
 const PAGE_SIZES: Record<PaperSize, [number, number]> = { A4: [595.28, 841.89], A3: [841.89, 1190.55], Legal: [612, 1008] };
@@ -253,19 +244,17 @@ const PAGE_SIZES: Record<PaperSize, [number, number]> = { A4: [595.28, 841.89], 
 /** Builds one PDF with the selected files of an order (images fitted to the paper size). Originals are not changed. */
 export async function buildPrintBundle(orderId: string, fileIds: string[]): Promise<Blob> {
   const { shopId } = await owner();
-  const db = readDb();
-  const order = findOrder(db, shopId, orderId);
-  const files = printableFiles(db, shopId, order.id, fileIds);
+  const order = await getOrder(orderId);
+  const files = printableFiles(order, await orderFileRows(shopId, order.id), fileIds);
   const { PDFDocument } = await import('pdf-lib');
   const out = await PDFDocument.create();
   out.setTitle('PrintFlow print job');
   const [pw, ph] = PAGE_SIZES[order.paperSize] ?? PAGE_SIZES.A4;
   const margin = 18;
 
+  const blobs = await downloadAll(files);
   for (const f of files) {
-    const blob = await getFile(f.id);
-    if (!blob) throw notFound(`"${f.originalName}" is missing from this browser’s storage.`);
-    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const bytes = new Uint8Array(await blobs.get(f.id)!.arrayBuffer());
     if (f.mime === 'application/pdf') {
       let src;
       try {
@@ -274,8 +263,8 @@ export async function buildPrintBundle(orderId: string, fileIds: string[]): Prom
         throw new ServiceError(
           422,
           /encrypt/i.test(String((err as Error)?.message))
-            ? `"${f.originalName}" is password protected. Download it and print it from a PDF reader.`
-            : `"${f.originalName}" could not be read as a PDF. Download it and print it from a PDF reader.`,
+            ? `"${f.original_name}" is password protected. Download it and print it from a PDF reader.`
+            : `"${f.original_name}" could not be read as a PDF. Download it and print it from a PDF reader.`,
         );
       }
       const pages = await out.copyPages(src, src.getPageIndices());
@@ -297,18 +286,9 @@ export async function buildPrintBundle(orderId: string, fileIds: string[]): Prom
 
 /** Records that files were sent to the printer, and optionally moves the order to "printing". */
 export async function logPrint(orderId: string, fileIds: string[], markPrinting: boolean): Promise<OrderDetail> {
-  const { shopId, actor } = await owner();
-  return writeDb((db) => {
-    const o = findOrder(db, shopId, orderId);
-    const files = printableFiles(db, shopId, o.id, fileIds);
-    const move = markPrinting && ORDER_TRANSITIONS[o.status].includes('printing');
-    const now = nowIso();
-    if (move) {
-      o.status = 'printing';
-      o.updatedAt = now;
-    }
-    addOrderEvent(db, o.id, o.status, `Sent ${files.length} file${files.length === 1 ? '' : 's'} to the printer (print dialog)`, actor, now);
-    logActivity(db, actor, 'Printed order files', `#${o.orderNo} · ${files.length} file(s)`, shopId);
-    return toOrderDetail(db, o);
-  });
+  const { shopId } = await owner();
+  const order = await getOrder(orderId);
+  const files = printableFiles(order, await orderFileRows(shopId, order.id), fileIds);
+  await rpc('printflow_shop_log_print', { p_order_id: order.id, p_file_ids: files.map((f) => f.id), p_mark_printing: markPrinting });
+  return getOrder(orderId);
 }

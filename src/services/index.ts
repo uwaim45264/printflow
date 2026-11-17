@@ -1,14 +1,14 @@
 /**
  * The app's data layer. UI code imports from here only.
  *
- * Today every service reads and writes browser storage (localStorage + IndexedDB) as a mock database.
- * To connect Supabase later, re-implement these modules with the same function names and return types;
- * pages and components do not need to change.
+ * Backed by Supabase: Postgres (with Row Level Security) and Storage.
+ * Own users/sessions tables (no Supabase Auth). See supabase/migrations for the database and
+ * supabase/functions/printflow-files for file downloads.
  */
 export * as authService from './authService';
 export * as adminService from './adminService';
 export * as shopService from './shopService';
 export * as publicService from './publicService';
 export { ServiceError, toServiceError } from './errors';
-export { onDbChange } from './storage/localDb';
-export { resetDemoData, DEMO_ACCOUNTS } from './seed';
+export { onDbChange } from './realtime';
+export { supabaseConfigured } from './supabase';
