@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import QRCode from 'qrcode';
-import { Copy, Download, ExternalLink, Printer, RefreshCw } from 'lucide-react';
+import { Download, Printer, RefreshCw } from 'lucide-react';
 import { shopService, ServiceError } from '../../services';
 import { useDocumentTitle } from '../../lib/router';
 import { Alert, Button, Card, CardHeader, PageHeader, Skeleton } from '../../components/ui';
@@ -85,26 +85,6 @@ export function ShopQrCode() {
                   Download PNG
                 </Button>
               </div>
-              <div>
-                <p className="mb-1.5 text-sm font-semibold text-ink">Upload link</p>
-                <div className="flex gap-2">
-                  <p className="min-w-0 flex-1 truncate rounded-xl border border-line bg-cream px-3 py-2.5 font-mono text-sm text-ink-soft" title={url}>
-                    {url}
-                  </p>
-                  <Button
-                    variant="secondary"
-                    className="w-11 shrink-0 px-0"
-                    aria-label="Copy link"
-                    onClick={() => navigator.clipboard?.writeText(url).then(() => toast('success', 'Link copied'))}
-                  >
-                    <Copy className="size-4" />
-                  </Button>
-                </div>
-                <a href={url} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1.5 text-sm font-semibold text-gold-ink hover:underline">
-                  Preview what customers see <ExternalLink className="size-3.5" aria-hidden />
-                </a>
-              </div>
-              <p className="text-sm text-muted">You can also share the link on WhatsApp so customers can send files before they arrive.</p>
             </div>
           </Card>
 
