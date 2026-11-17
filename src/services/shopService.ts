@@ -241,22 +241,48 @@ async function orderFileRows(shopId: string, orderId: string): Promise<OrderFile
 
 const PAGE_SIZES: Record<PaperSize, [number, number]> = { A4: [595.28, 841.89], A3: [841.89, 1190.55], Legal: [612, 1008] };
 
-/** Builds one PDF with the selected files of an order (images fitted to the paper size). Originals are not changed. */
+/**
+ * Where to draw content of size w×h, rotated `rot` degrees counter-clockwise and scaled by s, so it is centred on a
+ * pw×ph page. Returns the drawing origin (pdf-lib rotates around it).
+ */
+function placement(w: number, h: number, rot: number, s: number, pw: number, ph: number) {
+  const sideways = rot === 90 || rot === 270;
+  const bw = (sideways ? h : w) * s;
+  const bh = (sideways ? w : h) * s;
+  const left = (pw - bw) / 2;
+  const bottom = (ph - bh) / 2;
+  if (rot === 90) return { x: left + bw, y: bottom };
+  if (rot === 180) return { x: left + bw, y: bottom + bh };
+  if (rot === 270) return { x: left, y: bottom + bh };
+  return { x: left, y: bottom };
+}
+
+/**
+ * Builds one PDF with the selected files of an order. Originals are not changed.
+ * Every page is placed on the customer's paper size (portrait; wide pages are turned to fill the sheet), and the
+ * customer's copies and sides are stored as print presets, so Chrome/Edge fill them in the print dialog.
+ */
 export async function buildPrintBundle(orderId: string, fileIds: string[]): Promise<Blob> {
   const { shopId } = await owner();
   const order = await getOrder(orderId);
   const files = printableFiles(order, await orderFileRows(shopId, order.id), fileIds);
-  const { PDFDocument } = await import('pdf-lib');
+  const { PDFDocument, Duplex, degrees } = await import('pdf-lib');
   const out = await PDFDocument.create();
-  out.setTitle('PrintFlow print job');
+  out.setTitle(`PrintFlow order #${order.orderNo}`);
   const [pw, ph] = PAGE_SIZES[order.paperSize] ?? PAGE_SIZES.A4;
-  const margin = 18;
+  const margin = 18; // around photos/images only; PDF pages keep their own margins
+
+  const prefs = out.catalog.getOrCreateViewerPreferences();
+  prefs.setNumCopies(Math.max(1, Math.round(order.copies)));
+  prefs.setDuplex(order.sides === 'double' ? Duplex.DuplexFlipLongEdge : Duplex.Simplex);
+  prefs.setPickTrayByPDFSize(true);
+  prefs.setDisplayDocTitle(true);
 
   const blobs = await downloadAll(files);
   for (const f of files) {
     const bytes = new Uint8Array(await blobs.get(f.id)!.arrayBuffer());
     if (f.mime === 'application/pdf') {
-      let src;
+      let src: Awaited<ReturnType<typeof PDFDocument.load>>;
       try {
         src = await PDFDocument.load(bytes, { ignoreEncryption: false, updateMetadata: false });
       } catch (err) {
@@ -267,17 +293,32 @@ export async function buildPrintBundle(orderId: string, fileIds: string[]): Prom
             : `"${f.original_name}" could not be read as a PDF. Download it and print it from a PDF reader.`,
         );
       }
-      const pages = await out.copyPages(src, src.getPageIndices());
-      pages.forEach((p) => out.addPage(p));
+      const srcPages = src.getPages();
+      const boxes = srcPages.map((p) => {
+        const b = p.getCropBox();
+        return { left: b.x, bottom: b.y, right: b.x + b.width, top: b.y + b.height };
+      });
+      const embedded = await out.embedPages(srcPages, boxes);
+      srcPages.forEach((p, i) => {
+        const e = embedded[i];
+        // The page's own /Rotate turns it clockwise in viewers; drawing turns counter-clockwise.
+        const own = (((p.getRotation().angle % 360) + 360) % 360) as number;
+        let rot = (360 - own) % 360;
+        const sideways = rot === 90 || rot === 270;
+        const [vw, vh] = sideways ? [e.height, e.width] : [e.width, e.height];
+        if (vw > vh) rot = (rot + 90) % 360; // landscape page → turn to fill portrait paper
+        const turned = rot === 90 || rot === 270;
+        const s = Math.min(pw / (turned ? e.height : e.width), ph / (turned ? e.width : e.height));
+        const page = out.addPage([pw, ph]);
+        page.drawPage(e, { ...placement(e.width, e.height, rot, s, pw, ph), xScale: s, yScale: s, rotate: degrees(rot) });
+      });
     } else {
       const img = f.mime === 'image/png' ? await out.embedPng(bytes) : await out.embedJpg(bytes);
-      const landscape = img.width > img.height; // wide images go on landscape paper
-      const [w, h] = landscape ? [ph, pw] : [pw, ph];
-      const page = out.addPage([w, h]);
-      const scale = Math.min((w - margin * 2) / img.width, (h - margin * 2) / img.height);
-      const dw = img.width * scale;
-      const dh = img.height * scale;
-      page.drawImage(img, { x: (w - dw) / 2, y: (h - dh) / 2, width: dw, height: dh });
+      const rot = img.width > img.height ? 90 : 0; // wide images are turned to fill the portrait sheet
+      const [iw, ih] = rot ? [img.height, img.width] : [img.width, img.height];
+      const s = Math.min((pw - margin * 2) / iw, (ph - margin * 2) / ih);
+      const page = out.addPage([pw, ph]);
+      page.drawImage(img, { ...placement(img.width, img.height, rot, s, pw, ph), width: img.width * s, height: img.height * s, rotate: degrees(rot) });
     }
   }
   const pdf = await out.save();

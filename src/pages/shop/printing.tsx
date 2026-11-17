@@ -6,6 +6,7 @@ import { shopService, ServiceError } from '../../services';
 import { COLOR_LABEL, formatBytes, SIDES_LABEL } from '../../lib/format';
 import { Alert, Button, Modal, Skeleton, cx } from '../../components/ui';
 import { useToast } from '../../components/toast';
+import { isStaleBuildError, reloadForUpdate } from '../../lib/staleBuild';
 
 export const isPrintable = (f: OrderFile) => !f.purged && (f.mime === 'application/pdf' || f.mime === 'image/png' || f.mime === 'image/jpeg');
 
@@ -216,6 +217,12 @@ export function PrintDialog({
       onOrderUpdated(await shopService.logPrint(order.id, fileIds, markPrinting));
     } catch (err) {
       submitted.current = false;
+      if (isStaleBuildError(err)) {
+        setError('PrintFlow was just updated. Reloading the page — then press “Open print dialog” again.');
+        if (reloadForUpdate()) return;
+        setError('PrintFlow was updated. Please reload this page and try again.');
+        return;
+      }
       setError(err instanceof Error ? err.message : 'Printing failed.');
     } finally {
       setBusy(false);
@@ -289,7 +296,10 @@ function Reminder({ order }: { order: OrderDetail }) {
       <p className="mt-0.5 text-ink-soft">
         {order.copies} cop{order.copies === 1 ? 'y' : 'ies'} · {order.paperSize} · {COLOR_LABEL[order.colorMode]} · {SIDES_LABEL[order.sides]}
       </p>
-      <p className="mt-1 text-xs text-ink-soft">Set these in the print dialog.</p>
+      <p className="mt-1 text-xs text-ink-soft">
+        Copies, sides and paper size are filled in for you in Chrome and Edge — check them, and choose {COLOR_LABEL[order.colorMode].toLowerCase()} in the
+        dialog.
+      </p>
     </div>
   );
 }
