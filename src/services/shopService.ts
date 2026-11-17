@@ -31,7 +31,7 @@ import {
   type ShopRow,
 } from './mappers';
 import { requireRole } from './session';
-import { check, cleanupStorage, filesFunction, getToken, isUuid, rpc, supabase } from './supabase';
+import { BUCKET, check, cleanupStorage, filesFunction, getToken, isUuid, rpc, supabase } from './supabase';
 import { email, money, oneOf, phone, text } from './validate';
 
 /**
@@ -155,23 +155,53 @@ async function fileRow(shopId: string, fileId: string): Promise<OrderFileRow> {
   return row;
 }
 
-/** Downloads files through short-lived links from the printflow-files Edge Function (which checks the session). */
+const typed = (blob: Blob, mime: string) => (blob.type === mime ? blob : new Blob([blob], { type: mime }));
+
+/**
+ * Downloads files straight from Storage (Row Level Security checks the session header, see migration
+ * 20261117010000). If that is not set up, falls back to the printflow-files Edge Function.
+ */
 async function downloadAll(rows: OrderFileRow[]): Promise<Map<string, Blob>> {
   const token = getToken();
   if (!token) throw new ServiceError(401, 'Please sign in.');
-  const { files } = await filesFunction<{ files: { id: string; url: string | null; deleted: boolean }[] }>({
-    action: 'sign',
-    token,
-    fileIds: rows.map((r) => r.id),
-  });
+  const out = new Map<string, Blob>();
+  const missing: OrderFileRow[] = [];
+  for (const row of rows) {
+    if (!row.stored) throw new ServiceError(410, `"${row.original_name}" has been deleted.`);
+    const { data, error } = await supabase.storage.from(BUCKET).download(row.storage_path);
+    if (data && !error) out.set(row.id, typed(data, row.mime));
+    else missing.push(row);
+  }
+  if (missing.length) (await downloadViaFunction(token, missing)).forEach((blob, id) => out.set(id, blob));
+  return out;
+}
+
+/** Downloads files through short-lived links from the printflow-files Edge Function (which checks the session). */
+async function downloadViaFunction(token: string, rows: OrderFileRow[]): Promise<Map<string, Blob>> {
+  let files: { id: string; url: string | null; deleted: boolean }[];
+  try {
+    ({ files } = await filesFunction<{ files: { id: string; url: string | null; deleted: boolean }[] }>({
+      action: 'sign',
+      token,
+      fileIds: rows.map((r) => r.id),
+    }));
+  } catch (err) {
+    // 503 = function unreachable, 404 = function not deployed.
+    if (err instanceof ServiceError && (err.status === 503 || err.status === 404)) {
+      throw new ServiceError(
+        503,
+        `Could not open "${rows[0].original_name}". File access is not set up yet: run supabase/migrations/20261117010000_printflow_direct_file_access.sql in the Supabase SQL Editor.`,
+      );
+    }
+    throw err;
+  }
   const out = new Map<string, Blob>();
   for (const row of rows) {
     const link = files.find((f) => f.id === row.id);
     if (!link || link.deleted || !link.url) throw new ServiceError(410, `"${row.original_name}" has been deleted.`);
     const res = await fetch(link.url).catch(() => null);
     if (!res || !res.ok) throw new ServiceError(res?.status === 404 ? 404 : 503, `Could not download "${row.original_name}". Please try again.`);
-    const blob = await res.blob();
-    out.set(row.id, blob.type === row.mime ? blob : new Blob([blob], { type: row.mime }));
+    out.set(row.id, typed(await res.blob(), row.mime));
   }
   return out;
 }

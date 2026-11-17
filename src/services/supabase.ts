@@ -40,11 +40,11 @@ export function setToken(token: string | null) {
 
 export const TOKEN_STORAGE_KEY = TOKEN_KEY;
 
-/** Adds the session header to database (PostgREST) requests only. */
+/** Adds the session header to database (PostgREST) and Storage requests (RLS on both reads it). */
 const fetchWithSession: typeof fetch = (input, init) => {
   const target = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
   const token = getToken();
-  if (!token || !target.includes('/rest/v1/')) return fetch(input, init);
+  if (!token || !(target.includes('/rest/v1/') || target.includes('/storage/v1/'))) return fetch(input, init);
   const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
   headers.set('x-printflow-session', token);
   return fetch(input, { ...init, headers });
@@ -130,9 +130,22 @@ export async function filesFunction<T>(body: Record<string, unknown>): Promise<T
   return data as T;
 }
 
-/** Removes deleted files from Storage in the background (best effort). */
+/**
+ * Removes deleted files from Storage in the background (best effort). The database lists what the signed-in
+ * user may remove (see migration 20261117010000); the printflow-files Edge Function is used too if it is deployed.
+ */
 export function cleanupStorage() {
   if (!supabaseConfigured) return;
+  void (async () => {
+    const { data: paths, error } = await supabase.rpc('printflow_storage_to_delete_mine', { p_limit: 200 });
+    if (error || !Array.isArray(paths) || !paths.length) return;
+    for (let i = 0; i < paths.length; i += 100) {
+      const chunk = (paths as string[]).slice(i, i + 100);
+      const { data: removed } = await supabase.storage.from(BUCKET).remove(chunk);
+      const names = (removed ?? []).map((o) => o.name);
+      if (names.length) await supabase.rpc('printflow_storage_forget_deleted', { p_paths: names });
+    }
+  })().catch(() => {});
   void supabase.functions.invoke('printflow-files', { body: { action: 'cleanup' } }).catch(() => {});
 }
 
