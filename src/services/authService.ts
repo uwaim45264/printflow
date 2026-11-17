@@ -49,6 +49,25 @@ export async function logout(): Promise<void> {
   }
 }
 
+/** Super Admin only: changes their own username and name (needs the current password). Stays signed in. */
+export async function updateAdminAccount(currentPassword: string, usernameInput: string, nameInput: string): Promise<SessionUser> {
+  await requireUser();
+  const newUsername = text(usernameInput, 'username', { label: 'Username', required: true, max: 40 }).toLowerCase();
+  if (!/^[a-z0-9._-]{3,40}$/.test(newUsername)) {
+    throw invalid('Username must be 3–40 letters, numbers, dots, dashes or underscores.', 'username');
+  }
+  const name = text(nameInput, 'name', { label: 'Name', required: true, max: 80 });
+  if (!currentPassword) throw invalid('Enter your current password.', 'currentPassword');
+  const info = await rpc<SessionInfo>('printflow_admin_update_account', {
+    p_current_password: currentPassword,
+    p_username: newUsername,
+    p_name: name,
+  });
+  const token = getToken();
+  if (token) primeSession(token, info);
+  return toSessionUser(info);
+}
+
 /** Changes the signed-in user's password; other devices are signed out, this one stays signed in. */
 export async function changePassword(currentPassword: string, newPassword: string): Promise<SessionUser> {
   await requireUser(); // also works while a temporary password must be changed

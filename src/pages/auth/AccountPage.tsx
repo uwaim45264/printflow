@@ -1,6 +1,7 @@
 import { useAuth } from '../../lib/auth';
 import { useDocumentTitle } from '../../lib/router';
 import { Card, CardHeader, PageHeader } from '../../components/ui';
+import { AccountDetailsForm } from './AccountDetailsForm';
 import { ChangePasswordForm } from './ChangePasswordForm';
 
 export function AccountPage() {
@@ -28,6 +29,14 @@ export function AccountPage() {
               </div>
             </dl>
           </Card>
+          {user?.role === 'super_admin' && (
+            <Card>
+              <CardHeader title="Change username" description="Update the username and name you sign in with." />
+              <div className="p-5 sm:p-6">
+                <AccountDetailsForm />
+              </div>
+            </Card>
+          )}
         </div>
         <Card className="h-fit">
           <CardHeader title="Change password" description="Changing your password signs you out on other devices." />
