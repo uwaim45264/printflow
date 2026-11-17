@@ -287,34 +287,73 @@ function placement(w: number, h: number, rot: number, s: number, pw: number, ph:
   return { x: left, y: bottom };
 }
 
+/** Above this many printed pages the copies are not repeated inside the file (too slow to preview); the dialog's
+ *  Copies preset is used instead. */
+const MAX_BAKED_PAGES = 1500;
+
+/** Turns an image grey (for black & white orders), keeping PNG transparency. */
+async function toGrayscale(blob: Blob, mime: string): Promise<Uint8Array> {
+  const bitmap = await createImageBitmap(blob);
+  const canvas = document.createElement('canvas');
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d = img.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const y = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+    d[i] = d[i + 1] = d[i + 2] = y;
+  }
+  ctx.putImageData(img, 0, 0);
+  const out = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, mime, 0.92));
+  if (!out) throw new ServiceError(500, 'Could not prepare the image for black & white printing.');
+  return new Uint8Array(await out.arrayBuffer());
+}
+
+export interface PrintBundle {
+  blob: Blob;
+  /** True when every copy is already inside the file (leave Copies at 1 in the dialog). */
+  copiesIncluded: boolean;
+  /** Printed pages in the file (all copies, including blank backs added for double-sided). */
+  sheets: number;
+}
+
 /**
- * Builds one PDF with the selected files of an order. Originals are not changed.
- * Every page is placed on the customer's paper size (portrait; wide pages are turned to fill the sheet), and the
- * customer's copies and sides are stored as print presets, so Chrome/Edge fill them in the print dialog.
+ * Builds one PDF with the selected files of an order, ready to print as the customer asked. Originals are not changed.
+ *  - every page is placed on the customer's paper size (portrait; wide pages are turned to fill the sheet)
+ *  - the copies are repeated inside the file, so any printer prints them all with Copies = 1
+ *    (double-sided: a blank back is added after an odd page count so each copy starts on a new sheet)
+ *  - black & white orders: photos are made grey
+ *  - single/double-sided is stored as a print preset (Chrome/Edge pre-select it on printers that support it)
  */
-export async function buildPrintBundle(orderId: string, fileIds: string[]): Promise<Blob> {
+export async function buildPrintBundle(orderId: string, fileIds: string[]): Promise<PrintBundle> {
   const { shopId } = await owner();
   const order = await getOrder(orderId);
   const files = printableFiles(order, await orderFileRows(shopId, order.id), fileIds);
   const { PDFDocument, Duplex, degrees } = await import('pdf-lib');
+  type Page = ReturnType<Awaited<ReturnType<typeof PDFDocument.create>>['addPage']>;
   const out = await PDFDocument.create();
   out.setTitle(`PrintFlow order #${order.orderNo}`);
   const [pw, ph] = PAGE_SIZES[order.paperSize] ?? PAGE_SIZES.A4;
   const margin = 18; // around photos/images only; PDF pages keep their own margins
+  const double = order.sides === 'double';
 
   const prefs = out.catalog.getOrCreateViewerPreferences();
-  prefs.setNumCopies(Math.max(1, Math.round(order.copies)));
-  prefs.setDuplex(order.sides === 'double' ? Duplex.DuplexFlipLongEdge : Duplex.Simplex);
+  prefs.setDuplex(double ? Duplex.DuplexFlipLongEdge : Duplex.Simplex);
   prefs.setPickTrayByPDFSize(true);
   prefs.setDisplayDocTitle(true);
 
+  // One drawing step per page of one copy. Embedded files/images are shared, so repeating copies keeps the file small.
+  const draws: ((page: Page) => void)[] = [];
   const blobs = await downloadAll(files);
   for (const f of files) {
-    const bytes = new Uint8Array(await blobs.get(f.id)!.arrayBuffer());
+    const blob = blobs.get(f.id)!;
     if (f.mime === 'application/pdf') {
       let src: Awaited<ReturnType<typeof PDFDocument.load>>;
       try {
-        src = await PDFDocument.load(bytes, { ignoreEncryption: false, updateMetadata: false });
+        src = await PDFDocument.load(new Uint8Array(await blob.arrayBuffer()), { ignoreEncryption: false, updateMetadata: false });
       } catch (err) {
         throw new ServiceError(
           422,
@@ -332,27 +371,40 @@ export async function buildPrintBundle(orderId: string, fileIds: string[]): Prom
       srcPages.forEach((p, i) => {
         const e = embedded[i];
         // The page's own /Rotate turns it clockwise in viewers; drawing turns counter-clockwise.
-        const own = (((p.getRotation().angle % 360) + 360) % 360) as number;
+        const own = ((p.getRotation().angle % 360) + 360) % 360;
         let rot = (360 - own) % 360;
         const sideways = rot === 90 || rot === 270;
         const [vw, vh] = sideways ? [e.height, e.width] : [e.width, e.height];
         if (vw > vh) rot = (rot + 90) % 360; // landscape page → turn to fill portrait paper
         const turned = rot === 90 || rot === 270;
         const s = Math.min(pw / (turned ? e.height : e.width), ph / (turned ? e.width : e.height));
-        const page = out.addPage([pw, ph]);
-        page.drawPage(e, { ...placement(e.width, e.height, rot, s, pw, ph), xScale: s, yScale: s, rotate: degrees(rot) });
+        const at = placement(e.width, e.height, rot, s, pw, ph);
+        draws.push((page) => page.drawPage(e, { ...at, xScale: s, yScale: s, rotate: degrees(rot) }));
       });
     } else {
+      const bytes = order.colorMode === 'bw' ? await toGrayscale(blob, f.mime) : new Uint8Array(await blob.arrayBuffer());
       const img = f.mime === 'image/png' ? await out.embedPng(bytes) : await out.embedJpg(bytes);
       const rot = img.width > img.height ? 90 : 0; // wide images are turned to fill the portrait sheet
       const [iw, ih] = rot ? [img.height, img.width] : [img.width, img.height];
       const s = Math.min((pw - margin * 2) / iw, (ph - margin * 2) / ih);
-      const page = out.addPage([pw, ph]);
-      page.drawImage(img, { ...placement(img.width, img.height, rot, s, pw, ph), width: img.width * s, height: img.height * s, rotate: degrees(rot) });
+      const at = placement(img.width, img.height, rot, s, pw, ph);
+      draws.push((page) => page.drawImage(img, { ...at, width: img.width * s, height: img.height * s, rotate: degrees(rot) }));
     }
   }
+
+  const copies = Math.max(1, Math.round(order.copies));
+  const padBack = double && draws.length % 2 === 1 && copies > 1; // each copy starts on a fresh sheet
+  const perCopy = draws.length + (padBack ? 1 : 0);
+  const copiesIncluded = perCopy * copies <= MAX_BAKED_PAGES;
+  const repeat = copiesIncluded ? copies : 1;
+  if (!copiesIncluded) prefs.setNumCopies(copies); // too big to repeat: ask the dialog for the copies instead
+
+  for (let c = 0; c < repeat; c++) {
+    for (const draw of draws) draw(out.addPage([pw, ph]));
+    if (padBack && c < repeat - 1) out.addPage([pw, ph]); // blank back
+  }
   const pdf = await out.save();
-  return new Blob([pdf as BlobPart], { type: 'application/pdf' });
+  return { blob: new Blob([pdf as BlobPart], { type: 'application/pdf' }), copiesIncluded, sheets: out.getPageCount() };
 }
 
 /** Records that files were sent to the printer, and optionally moves the order to "printing". */

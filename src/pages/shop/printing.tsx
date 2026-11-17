@@ -76,11 +76,11 @@ let printFrame: HTMLIFrameElement | null = null;
 let printBlobUrl: string | null = null;
 
 /** Builds the merged PDF in the browser and returns an object URL for it. */
-async function makeBundle(orderId: string, fileIds: string[]): Promise<string> {
-  const blob = await shopService.buildPrintBundle(orderId, fileIds);
+async function makeBundle(orderId: string, fileIds: string[]): Promise<{ url: string; copiesIncluded: boolean; sheets: number }> {
+  const { blob, copiesIncluded, sheets } = await shopService.buildPrintBundle(orderId, fileIds);
   if (printBlobUrl) URL.revokeObjectURL(printBlobUrl);
   printBlobUrl = URL.createObjectURL(blob);
-  return printBlobUrl;
+  return { url: printBlobUrl, copiesIncluded, sheets };
 }
 
 function openPrintDialog(blobUrl: string): Promise<void> {
@@ -191,6 +191,7 @@ export function PrintDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [opened, setOpened] = useState<string | null>(null); // PDF URL after the dialog opened
+  const [bundle, setBundle] = useState<{ copiesIncluded: boolean; sheets: number } | null>(null);
   const submitted = useRef(false);
 
   const files = order.files.filter((f) => fileIds.includes(f.id));
@@ -201,6 +202,7 @@ export function PrintDialog({
     submitted.current = false;
     setError(null);
     setOpened(null);
+    setBundle(null);
     setBusy(false);
     setMarkPrinting(ORDER_TRANSITIONS[order.status].includes('printing'));
   }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -210,7 +212,8 @@ export function PrintDialog({
     setError(null);
     setBusy(true);
     try {
-      const url = await makeBundle(order.id, fileIds);
+      const { url, copiesIncluded, sheets } = await makeBundle(order.id, fileIds);
+      setBundle({ copiesIncluded, sheets });
       await openPrintDialog(url);
       setOpened(url);
       submitted.current = true;
@@ -261,12 +264,12 @@ export function PrintDialog({
           <Alert tone="success" title="Print dialog opened">
             Choose the printer and settings in the dialog and press Print. If nothing appeared, use “Open PDF instead” and print from there.
           </Alert>
-          <Reminder order={order} />
+          <Reminder order={order} bundle={bundle} />
         </div>
       ) : (
         <div className="space-y-5">
           {error && <Alert tone="danger">{error}</Alert>}
-          <Reminder order={order} />
+          <Reminder order={order} bundle={bundle} />
 
           <ul className="max-h-40 divide-y divide-line overflow-y-auto rounded-xl border border-line" aria-label="Files to print">
             {files.map((f) => (
@@ -289,17 +292,28 @@ export function PrintDialog({
   );
 }
 
-function Reminder({ order }: { order: OrderDetail }) {
+function Reminder({ order, bundle }: { order: OrderDetail; bundle: { copiesIncluded: boolean; sheets: number } | null }) {
+  const copiesIn = bundle ? bundle.copiesIncluded : true;
+  const steps = [
+    copiesIn
+      ? `Copies: leave at 1 — all ${order.copies} ${order.copies === 1 ? 'copy is' : 'copies are'} already in the file${bundle ? ` (${bundle.sheets} page${bundle.sheets === 1 ? '' : 's'})` : ''}.`
+      : `Copies: check it shows ${order.copies}.`,
+    `Paper size: ${order.paperSize}.`,
+    order.colorMode === 'bw' ? 'Colour: Black and white (photos are already made grey).' : 'Colour: Colour.',
+    order.sides === 'double' ? 'Two-sided: on (long edge).' : 'Two-sided: off.',
+  ];
   return (
     <div className="rounded-xl border border-gold/70 bg-gold-soft px-4 py-3 text-sm">
       <p className="font-semibold text-ink">Customer asked for</p>
       <p className="mt-0.5 text-ink-soft">
         {order.copies} cop{order.copies === 1 ? 'y' : 'ies'} · {order.paperSize} · {COLOR_LABEL[order.colorMode]} · {SIDES_LABEL[order.sides]}
       </p>
-      <p className="mt-1 text-xs text-ink-soft">
-        Copies, sides and paper size are filled in for you in Chrome and Edge — check them, and choose {COLOR_LABEL[order.colorMode].toLowerCase()} in the
-        dialog.
-      </p>
+      <p className="mt-2 text-xs font-semibold text-ink">In the print dialog</p>
+      <ul className="mt-0.5 list-disc space-y-0.5 pl-4 text-xs text-ink-soft">
+        {steps.map((s) => (
+          <li key={s}>{s}</li>
+        ))}
+      </ul>
     </div>
   );
 }
