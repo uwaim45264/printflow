@@ -61,8 +61,6 @@ export function LoginPage() {
         <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center py-12">
           <Logo />
           <h1 className="mt-10 text-3xl font-extrabold tracking-tight text-ink">Sign in</h1>
-          <p className="mt-2 text-[15px] text-muted">For shop owners and the platform administrator.</p>
-
           <form onSubmit={onSubmit} className="mt-8 space-y-5" noValidate>
             {error && <Alert tone="danger">{error}</Alert>}
             <Field label="Username">
